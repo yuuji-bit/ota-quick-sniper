@@ -8,7 +8,7 @@ from urllib.request import Request,urlopen
 from urllib.parse import urlencode
 from flask import Flask,render_template,request,jsonify,Response
 
-APP_VERSION="1.6.1 RESULT FIX"
+APP_VERSION="1.7.0 PERSIST"
 APP_NAME="OTA QUICK SNIPER"
 BASE_URL="https://www.boatrace.jp/owpc/pc/race"
 TIMEOUT=15
@@ -37,6 +37,10 @@ CACHE_SECONDS=90
 VERIFY_STAKE_YEN=200
 VERIFY_DIR=os.environ.get("OTA_DATA_DIR",os.path.join(os.path.dirname(__file__),"ota_verify_data"))
 VERIFY_FILE=os.path.join(VERIFY_DIR,"analysis_log.json")
+SUPABASE_URL=os.environ.get("SUPABASE_URL","").rstrip("/")
+SUPABASE_KEY=os.environ.get("SUPABASE_KEY","")
+SUPABASE_TABLE=os.environ.get("SUPABASE_TABLE","ota_quick_logs")
+
 os.makedirs(VERIFY_DIR,exist_ok=True)
 
 def normalize_space(s):
@@ -449,15 +453,70 @@ def analyze(jcd,rno,hd):
             "third_rank":[r["lane"] for r in sorted(ranked,key=lambda x:x["third_score"],reverse=True)],"cached":False}
     CACHE[key]={"time":now,"data":result};return result
 
+def supabase_enabled():
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
 def load_logs():
+    if supabase_enabled():
+        try:
+            url=f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?select=payload&order=sort_key.asc"
+            req=Request(url,headers={
+                "apikey":SUPABASE_KEY,
+                "Authorization":f"Bearer {SUPABASE_KEY}",
+                "Accept":"application/json"
+            })
+            with urlopen(req,timeout=TIMEOUT) as res:
+                rows=json.loads(res.read().decode("utf-8"))
+            return [r["payload"] for r in rows if isinstance(r.get("payload"),dict)]
+        except Exception as e:
+            print("Supabase load error:",e)
+
     try:
         with open(VERIFY_FILE,"r",encoding=ENC_NAME) as f:
-            d=json.load(f);return d if isinstance(d,list) else []
-    except:return []
+            d=json.load(f)
+            return d if isinstance(d,list) else []
+    except Exception:
+        return []
 
 def save_logs(logs):
+    if supabase_enabled():
+        try:
+            rows=[]
+            now=datetime.datetime.now(datetime.timezone.utc).isoformat()
+            for rec in logs:
+                key=rec.get("key")
+                if not key:
+                    continue
+                rows.append({
+                    "race_key":key,
+                    "sort_key":f"{rec.get('date','')}:{rec.get('venue_code','')}:{int(rec.get('race',0)):02d}",
+                    "payload":rec,
+                    "updated_at":now
+                })
+
+            if rows:
+                url=f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?on_conflict=race_key"
+                data=json.dumps(rows,ensure_ascii=False).encode("utf-8")
+                req=Request(
+                    url,
+                    data=data,
+                    method="POST",
+                    headers={
+                        "apikey":SUPABASE_KEY,
+                        "Authorization":f"Bearer {SUPABASE_KEY}",
+                        "Content-Type":"application/json",
+                        "Prefer":"resolution=merge-duplicates,return=minimal"
+                    }
+                )
+                with urlopen(req,timeout=TIMEOUT) as res:
+                    res.read()
+            return
+        except Exception as e:
+            print("Supabase save error:",e)
+
     tmp=VERIFY_FILE+".tmp"
-    with open(tmp,"w",encoding=ENC_NAME) as f:json.dump(logs,f,ensure_ascii=False,indent=2)
+    with open(tmp,"w",encoding=ENC_NAME) as f:
+        json.dump(logs,f,ensure_ascii=False,indent=2)
     os.replace(tmp,VERIFY_FILE)
 
 def save_analysis_log(data):
@@ -625,6 +684,15 @@ def verify_update():
 @app.route("/api/verify/stats")
 def verify_stats():
     return jsonify({"ok":True,"stats":stats(200)})
+
+@app.route("/api/verify/storage")
+def verify_storage():
+    return jsonify({
+        "ok":True,
+        "mode":"supabase" if supabase_enabled() else "local",
+        "persistent":bool(supabase_enabled()),
+        "table":SUPABASE_TABLE if supabase_enabled() else None
+    })
 
 @app.route("/verify")
 def verify_page():
