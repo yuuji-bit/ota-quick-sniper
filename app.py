@@ -8,7 +8,7 @@ from urllib.request import Request,urlopen
 from urllib.parse import urlencode
 from flask import Flask,render_template,request,jsonify,Response
 
-APP_VERSION="1.6.0 VERIFY"
+APP_VERSION="1.6.1 RESULT FIX"
 APP_NAME="OTA QUICK SNIPER"
 BASE_URL="https://www.boatrace.jp/owpc/pc/race"
 TIMEOUT=15
@@ -472,36 +472,108 @@ def save_analysis_log(data):
     logs=[rec if x.get("key")==key else x for x in logs] if old else logs+[rec]
     logs.sort(key=lambda x:(x.get("date",""),x.get("venue_code",""),int(x.get("race",0))));save_logs(logs)
 
-def resultlist_url(hd,jcd):
-    return "https://www.boatrace.jp/owpc/pc/race/resultlist?"+urlencode({"hd":hd,"jcd":str(jcd).zfill(2)})
+def raceresult_url(hd,jcd,rno):
+    return "https://www.boatrace.jp/owpc/pc/race/raceresult?"+urlencode({
+        "hd":hd,
+        "jcd":str(jcd).zfill(2),
+        "rno":int(rno)
+    })
 
-def parse_result(src,rno):
-    for row in extract_rows(src):
-        txt=strip_tags(row)
-        if not re.search(rf"(?<!\d){int(rno)}R(?!\d)",txt):continue
-        cleaned=txt.replace("−","-").replace("‐","-").replace("ー","-")
-        m=re.search(r"(?<!\d)([1-6])\s*-\s*([1-6])\s*-\s*([1-6]).*?[¥￥]\s*([\d,]+)",cleaned)
-        if not m:m=re.search(r"(?<!\d)([1-6])\s+([1-6])\s+([1-6]).*?[¥￥]\s*([\d,]+)",cleaned)
-        if m:return {"result":f"{m.group(1)}-{m.group(2)}-{m.group(3)}","payout_100":int(m.group(4).replace(",",""))}
-    return None
+def parse_result_page(src):
+    """
+    BOAT RACE公式の各レース結果ページから
+    3連単の組番と100円払戻金を取得。
+    """
+    if not src:
+        return None
+
+    text = strip_tags(src)
+    cleaned = (
+        text.replace("−","-")
+            .replace("‐","-")
+            .replace("ー","-")
+            .replace("–","-")
+            .replace("—","-")
+    )
+
+    # まず「3連単」周辺だけに絞る
+    pos = cleaned.find("3連単")
+    if pos < 0:
+        return None
+
+    tail = cleaned[pos:pos+500]
+
+    # 典型: 3連単 1-5-2 ¥3,290 12
+    m = re.search(
+        r"3連単\s*([1-6])\s*-\s*([1-6])\s*-\s*([1-6])"
+        r"\s*[¥￥]\s*([\d,]+)",
+        tail
+    )
+
+    if not m:
+        # HTMLテーブルの改行・空白が強い場合
+        m = re.search(
+            r"3連単.*?([1-6])\s*-\s*([1-6])\s*-\s*([1-6])"
+            r".*?[¥￥]\s*([\d,]+)",
+            tail,
+            re.S
+        )
+
+    if not m:
+        return None
+
+    return {
+        "result": f"{m.group(1)}-{m.group(2)}-{m.group(3)}",
+        "payout_100": int(m.group(4).replace(",",""))
+    }
 
 def update_results():
-    logs=load_logs();pages={};checked=updated=0
+    logs=load_logs()
+    checked=0
+    updated=0
+    errors=[]
+
     for rec in logs:
-        if rec.get("result_status")=="done":continue
+        if rec.get("result_status")=="done":
+            continue
+
         checked+=1
-        key=f"{rec['date']}:{rec['venue_code']}"
+
         try:
-            if key not in pages:pages[key]=http_get(resultlist_url(rec["date"],rec["venue_code"]))
-            p=parse_result(pages[key],rec["race"])
-            if not p:continue
-            rec["result"]=p["result"];rec["payout_100"]=p["payout_100"];rec["result_status"]="done"
+            url=raceresult_url(
+                rec["date"],
+                rec["venue_code"],
+                rec["race"]
+            )
+
+            src=http_get(url)
+            p=parse_result_page(src)
+
             rec["result_checked_at"]=datetime.datetime.now().isoformat(timespec="seconds")
-            try:rec["hit_rank"]=(rec.get("bets") or []).index(rec["result"])+1
-            except ValueError:rec["hit_rank"]=None
+
+            if not p:
+                rec["result_status"]="pending"
+                continue
+
+            rec["result"]=p["result"]
+            rec["payout_100"]=p["payout_100"]
+            rec["result_status"]="done"
+
+            try:
+                rec["hit_rank"]=(rec.get("bets") or []).index(rec["result"])+1
+            except ValueError:
+                rec["hit_rank"]=None
+
             updated+=1
-        except:pass
-    save_logs(logs);return checked,updated
+
+        except Exception as e:
+            errors.append({
+                "key":rec.get("key"),
+                "error":str(e)
+            })
+
+    save_logs(logs)
+    return checked,updated
 
 def calc_bucket(records,n,stake=200):
     done=[r for r in records if r.get("result_status")=="done" and r.get("result")]
