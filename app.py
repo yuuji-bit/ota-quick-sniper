@@ -8,7 +8,7 @@ from urllib.request import Request,urlopen
 from urllib.parse import urlencode
 from flask import Flask,render_template,request,jsonify,Response
 
-APP_VERSION="1.7.0 PERSIST"
+APP_VERSION="1.7.1 LIGHT VERIFY"
 APP_NAME="OTA QUICK SNIPER"
 BASE_URL="https://www.boatrace.jp/owpc/pc/race"
 TIMEOUT=15
@@ -35,6 +35,8 @@ CACHE={}
 CACHE_SECONDS=90
 
 VERIFY_STAKE_YEN=200
+VERIFY_UPDATE_LIMIT=20
+SUPABASE_PAGE_SIZE=1000
 VERIFY_DIR=os.environ.get("OTA_DATA_DIR",os.path.join(os.path.dirname(__file__),"ota_verify_data"))
 VERIFY_FILE=os.path.join(VERIFY_DIR,"analysis_log.json")
 SUPABASE_URL=os.environ.get("SUPABASE_URL","").rstrip("/")
@@ -459,15 +461,38 @@ def supabase_enabled():
 def load_logs():
     if supabase_enabled():
         try:
-            url=f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?select=payload&order=sort_key.asc"
-            req=Request(url,headers={
-                "apikey":SUPABASE_KEY,
-                "Authorization":f"Bearer {SUPABASE_KEY}",
-                "Accept":"application/json"
-            })
-            with urlopen(req,timeout=TIMEOUT) as res:
-                rows=json.loads(res.read().decode("utf-8"))
-            return [r["payload"] for r in rows if isinstance(r.get("payload"),dict)]
+            all_logs=[]
+            offset=0
+
+            while True:
+                url=(
+                    f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
+                    f"?select=payload&order=sort_key.asc"
+                    f"&limit={SUPABASE_PAGE_SIZE}&offset={offset}"
+                )
+                req=Request(url,headers={
+                    "apikey":SUPABASE_KEY,
+                    "Authorization":f"Bearer {SUPABASE_KEY}",
+                    "Accept":"application/json"
+                })
+                with urlopen(req,timeout=TIMEOUT) as res:
+                    rows=json.loads(res.read().decode("utf-8"))
+
+                if not isinstance(rows,list):
+                    break
+
+                for row in rows:
+                    payload=row.get("payload") if isinstance(row,dict) else None
+                    if isinstance(payload,dict):
+                        all_logs.append(payload)
+
+                if len(rows)<SUPABASE_PAGE_SIZE:
+                    break
+
+                offset+=SUPABASE_PAGE_SIZE
+
+            return all_logs
+
         except Exception as e:
             print("Supabase load error:",e)
 
@@ -520,16 +545,40 @@ def save_logs(logs):
     os.replace(tmp,VERIFY_FILE)
 
 def save_analysis_log(data):
-    logs=load_logs();key=f"{data['date']}:{str(data['venue_code']).zfill(2)}:{int(data['race'])}"
+    logs=load_logs()
+    key=f"{data['date']}:{str(data['venue_code']).zfill(2)}:{int(data['race'])}"
     old=next((x for x in logs if x.get("key")==key),None)
-    rec={"key":key,"saved_at":datetime.datetime.now().isoformat(timespec="seconds"),"app_version":data.get("app_version",""),
-         "date":data["date"],"venue_code":str(data["venue_code"]).zfill(2),"venue":data.get("venue",""),"race":int(data["race"]),
-         "judge":data.get("judge",""),"confidence":int(data.get("confidence",0) or 0),"coverage":float(data.get("coverage",0) or 0),
-         "bets":list(data.get("bets") or [])[:7],"result":None,"payout_100":None,"result_status":"pending","hit_rank":None}
+
+    rec={
+        "key":key,
+        "saved_at":datetime.datetime.now().isoformat(timespec="seconds"),
+        "app_version":data.get("app_version",""),
+        "date":data["date"],
+        "venue_code":str(data["venue_code"]).zfill(2),
+        "venue":data.get("venue",""),
+        "race":int(data["race"]),
+        "judge":data.get("judge",""),
+        "confidence":int(data.get("confidence",0) or 0),
+        "coverage":float(data.get("coverage",0) or 0),
+        "bets":list(data.get("bets") or [])[:7],
+        "result":None,
+        "payout_100":None,
+        "result_status":"pending",
+        "hit_rank":None
+    }
+
     if old and old.get("result"):
-        for k in ("result","payout_100","result_status","hit_rank","result_checked_at"):rec[k]=old.get(k)
-    logs=[rec if x.get("key")==key else x for x in logs] if old else logs+[rec]
-    logs.sort(key=lambda x:(x.get("date",""),x.get("venue_code",""),int(x.get("race",0))));save_logs(logs)
+        for k in ("result","payout_100","result_status","hit_rank","result_checked_at"):
+            rec[k]=old.get(k)
+
+    if supabase_enabled():
+        # Supabaseでは変更した1レースだけをUPSERT。
+        # 履歴が増えても毎回全件を書き戻さない。
+        save_logs([rec])
+    else:
+        logs=[rec if x.get("key")==key else x for x in logs] if old else logs+[rec]
+        logs.sort(key=lambda x:(x.get("date",""),x.get("venue_code",""),int(x.get("race",0))))
+        save_logs(logs)
 
 def raceresult_url(hd,jcd,rno):
     return "https://www.boatrace.jp/owpc/pc/race/raceresult?"+urlencode({
@@ -586,18 +635,28 @@ def parse_result_page(src):
         "payout_100": int(m.group(4).replace(",",""))
     }
 
-def update_results():
+def update_results(limit=VERIFY_UPDATE_LIMIT):
     logs=load_logs()
     checked=0
     updated=0
     errors=[]
 
-    for rec in logs:
-        if rec.get("result_status")=="done":
-            continue
+    pending=[r for r in logs if r.get("result_status")!="done"]
 
+    # 同じ未確定20件だけを毎回調べ続けないよう、
+    # 最終確認時刻が古いものから順に回す。
+    pending.sort(key=lambda r:(
+        r.get("result_checked_at") or "",
+        r.get("date",""),
+        r.get("venue_code",""),
+        int(r.get("race",0) or 0)
+    ))
+
+    targets=pending[:max(1,int(limit))]
+    touched=[]
+
+    for rec in targets:
         checked+=1
-
         try:
             url=raceresult_url(
                 rec["date"],
@@ -610,29 +669,39 @@ def update_results():
 
             rec["result_checked_at"]=datetime.datetime.now().isoformat(timespec="seconds")
 
-            if not p:
+            if p:
+                rec["result"]=p["result"]
+                rec["payout_100"]=p["payout_100"]
+                rec["result_status"]="done"
+
+                try:
+                    rec["hit_rank"]=(rec.get("bets") or []).index(rec["result"])+1
+                except ValueError:
+                    rec["hit_rank"]=None
+
+                updated+=1
+            else:
                 rec["result_status"]="pending"
-                continue
 
-            rec["result"]=p["result"]
-            rec["payout_100"]=p["payout_100"]
-            rec["result_status"]="done"
-
-            try:
-                rec["hit_rank"]=(rec.get("bets") or []).index(rec["result"])+1
-            except ValueError:
-                rec["hit_rank"]=None
-
-            updated+=1
+            touched.append(rec)
 
         except Exception as e:
+            rec["result_checked_at"]=datetime.datetime.now().isoformat(timespec="seconds")
+            touched.append(rec)
             errors.append({
                 "key":rec.get("key"),
                 "error":str(e)
             })
 
-    save_logs(logs)
-    return checked,updated
+    if supabase_enabled():
+        # 今回確認した最大20件だけ保存。
+        if touched:
+            save_logs(touched)
+    else:
+        save_logs(logs)
+
+    remaining=max(0,len(pending)-checked)
+    return checked,updated,remaining,len(errors)
 
 def calc_bucket(records,n,stake=200):
     done=[r for r in records if r.get("result_status")=="done" and r.get("result")]
@@ -679,7 +748,15 @@ def api_analyze():
 
 @app.route("/api/verify/update",methods=["GET","POST"])
 def verify_update():
-    c,u=update_results();return jsonify({"ok":True,"checked":c,"updated":u})
+    c,u,remaining,error_count=update_results(VERIFY_UPDATE_LIMIT)
+    return jsonify({
+        "ok":True,
+        "checked":c,
+        "updated":u,
+        "remaining":remaining,
+        "errors":error_count,
+        "limit":VERIFY_UPDATE_LIMIT
+    })
 
 @app.route("/api/verify/stats")
 def verify_stats():
@@ -702,7 +779,7 @@ body{font-family:-apple-system,sans-serif;background:#f4f7fb;margin:0;color:#182
 .c{background:#fff;border-radius:14px;padding:14px;margin:12px 0}button{border:0;border-radius:10px;padding:12px;background:#1268d6;color:#fff;font-size:16px}
 table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid #ddd;text-align:right}th:first-child,td:first-child{text-align:left}
 .g{color:green;font-weight:bold}.b{color:#d33;font-weight:bold}</style></head><body><div class="w">
-<h2>🚤 OTA QUICK SNIPER 検証</h2><div class="c"><button onclick="upd()">公式結果を更新</button><p id="s">解析すると自動保存されます。</p></div>
+<h2>🚤 OTA QUICK SNIPER 検証</h2><div class="c"><button id="ub" onclick="upd()">公式結果を20R更新</button><p id="s">解析すると自動保存されます。結果更新は1回最大20Rです。</p></div>
 <div class="c"><b>保存:</b> <span id="sv">-</span>　<b>確定:</b> <span id="dn">-</span>　<b>待ち:</b> <span id="pd">-</span></div>
 <div class="c"><h3>上位何点まで買った場合</h3><table><thead><tr><th>買い方</th><th>的中率</th><th>回収率</th><th>収支</th></tr></thead><tbody id="br"></tbody></table></div>
 <div class="c"><h3>会場別（上位2点）</h3><table><thead><tr><th>会場</th><th>R</th><th>的中率</th><th>回収率</th><th>収支</th></tr></thead><tbody id="vr"></tbody></table></div>
@@ -714,7 +791,7 @@ sv.textContent=s.total_saved;dn.textContent=s.completed;pd.textContent=s.pending
 br.innerHTML='';for(let n=1;n<=7;n++){let b=s.buckets[String(n)];br.innerHTML+=`<tr><td>上位${n}点</td><td>${p(b.hit_rate)}</td><td class="${b.return_rate>=100?'g':'b'}">${p(b.return_rate)}</td><td class="${b.profit>=0?'g':'b'}">${y(b.profit)}</td></tr>`}
 vr.innerHTML='';for(const v of s.venues){vr.innerHTML+=`<tr><td>${v.venue}</td><td>${v.races}</td><td>${p(v.top2_hit_rate)}</td><td class="${v.top2_return_rate>=100?'g':'b'}">${p(v.top2_return_rate)}</td><td>${y(v.top2_profit)}</td></tr>`}
 cr.innerHTML='';for(const b of s.confidence_bands){cr.innerHTML+=`<tr><td>${b.band}</td><td>${b.races}</td><td>${p(b.hit_rate)}</td><td class="${b.return_rate>=100?'g':'b'}">${p(b.return_rate)}</td><td>${y(b.profit)}</td></tr>`}}
-async function upd(){s.textContent='更新中...';let j=await (await fetch('/api/verify/update',{method:'POST'})).json();s.textContent=`確認${j.checked}R / 新規確定${j.updated}R`;load()}load();
+async function upd(){ub.disabled=true;s.textContent='最大20Rを更新中...';try{let j=await (await fetch('/api/verify/update',{method:'POST'})).json();s.textContent=`確認${j.checked}R / 新規確定${j.updated}R / 更新対象残り${j.remaining}R`;await load()}catch(e){s.textContent='更新に失敗しました。少し待って再度押してください。'}finally{ub.disabled=false}}load();
 </script></div></body></html>""",mimetype="text/html")
 
 if __name__=="__main__":
