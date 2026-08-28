@@ -8,7 +8,7 @@ from urllib.request import Request,urlopen
 from urllib.parse import urlencode
 from flask import Flask,render_template,request,jsonify,Response
 
-APP_VERSION="1.7.1 EV"
+APP_VERSION="1.7.2 EV-FIX"
 APP_NAME="OTA QUICK SNIPER"
 BASE_URL="https://www.boatrace.jp/owpc/pc/race"
 TIMEOUT=15
@@ -458,35 +458,54 @@ DEFAULT_EV_THRESHOLD=5.0
 
 def parse_odds3t(src):
     """3連単オッズページから { "a-b-c": オッズ } を抽出する。
-    本体のextract_rows/extract_cellsをそのまま使い、新規の依存を増やさない。"""
+    本体のextract_rows/extract_cellsをそのまま使い、新規の依存を増やさない。
+
+    v1.7.1 EV fix: 実際に取得したデータで検証したところ、1行(<tr>)の中に
+    複数の「組番+オッズ」の組が横に並ぶ表組みだったため、1行につき最初の
+    1件しか拾えず120通り中10通りしか取得できないバグがあった。
+    finditerで行内の組番出現位置を全部走査し、それぞれの直後にある
+    オッズらしき数値を個別に対応付ける方式に変更する。"""
     odds={}
     combo_re=re.compile(r"\b([1-6])\s*[-－]\s*([1-6])\s*[-－]\s*([1-6])\b")
     odds_re=re.compile(r"\b(\d{1,4}(?:\.\d)?)\b")
 
     for row_html in extract_rows(src or ""):
         text=normalize_space(strip_tags(row_html))
-        cells=extract_cells(row_html)
 
-        combo=None
-        m=combo_re.search(text)
-        if m:
-            a,b,c=m.groups()
-            if a!=b and b!=c and a!=c:
-                combo=f"{a}-{b}-{c}"
-        if combo is None:
+        matches=list(combo_re.finditer(text))
+        if not matches:
+            # 組番がテキスト中で「1-2-3」のような形になっていない
+            # (セル区切りのみの)ケースへのフォールバック
+            cells=extract_cells(row_html)
             nums=[c for c in cells if c.isdigit() and 1<=int(c)<=6]
             if len(nums)>=3:
-                combo=f"{nums[0]}-{nums[1]}-{nums[2]}"
-        if combo is None:
+                a,b,c=nums[0],nums[1],nums[2]
+                if a!=b and b!=c and a!=c:
+                    m_odds=odds_re.findall(text)
+                    for om in reversed(m_odds):
+                        v=to_float(om,None)
+                        if v is not None and v>=1.0:
+                            odds[f"{a}-{b}-{c}"]=v;break
             continue
 
-        odds_val=None
-        for om in reversed(odds_re.findall(text)):
-            v=to_float(om,None)
-            if v is not None and v>=1.0:
-                odds_val=v;break
-        if odds_val is not None:
-            odds[combo]=odds_val
+        # 行内に複数の組番が並ぶケース: 各組番の出現位置から次の組番の
+        # 出現位置(または行末)までの範囲だけを見て、その中の最初の
+        # オッズらしき数値をその組番に対応付ける。
+        for i,m in enumerate(matches):
+            a,b,c=m.groups()
+            if a==b or b==c or a==c:
+                continue
+            combo=f"{a}-{b}-{c}"
+            start=m.end()
+            end=matches[i+1].start() if i+1<len(matches) else len(text)
+            segment=text[start:end]
+            odds_val=None
+            for om in odds_re.findall(segment):
+                v=to_float(om,None)
+                if v is not None and v>=1.0:
+                    odds_val=v;break
+            if odds_val is not None:
+                odds[combo]=odds_val
 
     return odds
 
