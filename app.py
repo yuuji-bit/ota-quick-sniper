@@ -9,7 +9,7 @@ from urllib.request import Request,urlopen
 from urllib.parse import urlencode
 from flask import Flask,render_template,request,jsonify,Response,session,redirect,url_for
 
-APP_VERSION="1.9.1 EV-PRIVATE+VERIFY+ODDSFIX"
+APP_VERSION="1.9.2 EV-PRIVATE+VERIFY+ODDS-DESKTOP-FIX"
 APP_NAME="OTA QUICK SNIPER"
 BASE_URL="https://www.boatrace.jp/owpc/pc/race"
 TIMEOUT=15
@@ -609,10 +609,76 @@ def parse_odds3t(src):
     return matrix_odds if len(matrix_odds)>=len(explicit_odds) else explicit_odds
 
 
+# 3連単オッズ専用: 通常OTAのiPhone UAとは分離する。
+# BOAT RACE公式のPCオッズ表はアクセス条件によって返却HTMLが変わることがあるため、
+# EV側だけデスクトップChrome相当UAで取得し、取得件数が不足した場合は複数条件で再取得する。
+ODDS_DESKTOP_HEADERS={
+    "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "Accept-Language":"ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6",
+    "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Cache-Control":"no-cache",
+    "Pragma":"no-cache",
+    "Connection":"close",
+}
+
+def http_get_with_headers(url,headers):
+    last=None
+    for attempt in range(RETRY+1):
+        try:
+            req=Request(url,headers=headers)
+            with urlopen(req,timeout=TIMEOUT) as res:
+                raw=res.read()
+                for enc in ("utf-8","cp932","shift_jis"):
+                    try:return raw.decode(enc)
+                    except:pass
+                return raw.decode("utf-8",errors="replace")
+        except Exception as e:
+            last=e
+            if attempt<RETRY:time.sleep(.8)
+    raise RuntimeError(f"通信失敗: {last}")
+
 def fetch_odds3t(jcd,hd,rno):
     url=make_url("odds3t",hd,jcd,rno)
-    src=http_get(url)
-    return parse_odds3t(src),url
+    attempts=[]
+
+    # 1) PC版オッズ表をデスクトップUAで取得。通常OTA本体のHEADERSは変更しない。
+    try:
+        h=dict(ODDS_DESKTOP_HEADERS)
+        h["Referer"]=make_url("raceindex",hd,jcd,rno)
+        src=http_get_with_headers(url,h)
+        odds=parse_odds3t(src)
+        attempts.append((len(odds),odds))
+        if len(odds)>=MIN_ODDS_COVERAGE:
+            return odds,url
+    except Exception:
+        pass
+
+    # 2) キャッシュ回避用クエリを付けて再取得。
+    try:
+        sep="&" if "?" in url else "?"
+        live_url=f"{url}{sep}_ota_ts={int(time.time()*1000)}"
+        h=dict(ODDS_DESKTOP_HEADERS)
+        h["Referer"]=url
+        src=http_get_with_headers(live_url,h)
+        odds=parse_odds3t(src)
+        attempts.append((len(odds),odds))
+        if len(odds)>=MIN_ODDS_COVERAGE:
+            return odds,url
+    except Exception:
+        pass
+
+    # 3) 旧iPhone UAでも試し、最も多く取得できた結果だけを採用。
+    try:
+        src=http_get(url)
+        odds=parse_odds3t(src)
+        attempts.append((len(odds),odds))
+    except Exception:
+        pass
+
+    if attempts:
+        attempts.sort(key=lambda x:x[0],reverse=True)
+        return attempts[0][1],url
+    return {},url
 
 
 def softmax_dict(scores, temperature):
