@@ -3,18 +3,42 @@ ENC_NAME="utf-8"
 ECL_NAME="M"
 TARGET_BYTES=262
 
-import re,os,json,time,html,datetime
+import re,os,json,time,html,datetime,math,hashlib,hmac
+from functools import wraps
 from urllib.request import Request,urlopen
 from urllib.parse import urlencode
-from flask import Flask,render_template,request,jsonify,Response
+from flask import Flask,render_template,request,jsonify,Response,session,redirect,url_for
 
-APP_VERSION="1.7.2 EV-FIX"
+APP_VERSION="1.9.0 EV-PRIVATE+VERIFY"
 APP_NAME="OTA QUICK SNIPER"
 BASE_URL="https://www.boatrace.jp/owpc/pc/race"
 TIMEOUT=15
 RETRY=2
 
 app=Flask(__name__)
+
+# --- EV専用ページ認証 ---
+# RenderのEnvironmentに EV_PASSWORD を設定するだけで使える。
+EV_PASSWORD=os.environ.get("EV_PASSWORD","")
+EV_LOGIN_DAYS=int(os.environ.get("EV_LOGIN_DAYS","90") or 90)
+EV_COOKIE_SECURE=os.environ.get("EV_COOKIE_SECURE","1")!="0"
+_session_seed=("ota-quick-sniper-ev:"+EV_PASSWORD).encode("utf-8") if EV_PASSWORD else os.urandom(32)
+app.secret_key=hashlib.sha256(_session_seed).digest()
+app.permanent_session_lifetime=datetime.timedelta(days=EV_LOGIN_DAYS)
+app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE="Lax",SESSION_COOKIE_SECURE=EV_COOKIE_SECURE)
+
+def ev_auth_ok():
+    return bool(session.get("ev_auth"))
+
+def ev_login_required(fn):
+    @wraps(fn)
+    def wrapped(*args,**kwargs):
+        if not ev_auth_ok():
+            if request.path.startswith("/api/"):
+                return jsonify({"ok":False,"error":"EV専用ページへのログインが必要です"}),401
+            return redirect(url_for("ev_login",next=request.full_path.rstrip("?")))
+        return fn(*args,**kwargs)
+    return wrapped
 
 VENUES={
 "01":"桐生","02":"戸田","03":"江戸川","04":"平和島","05":"多摩川","06":"浜名湖",
@@ -453,7 +477,22 @@ def generate_bets(racers,max_bets=7):
 import itertools
 
 MIN_ODDS_COVERAGE=100  # 120通り中これ未満しか取れなければオッズ不完全とみなし候補を出さない
-DEFAULT_EV_THRESHOLD=5.0
+DEFAULT_EV_THRESHOLD=5.0  # 後方互換用(旧ev_pct基準)。新方式ではEV_MINを使う。
+
+# --- v1.8 新確率モデルのパラメータ ---
+# head_score/second_score/third_scoreは0-100スケールのスコアなので、
+# Softmaxの温度もそのスケール感に合わせた値を初期値としている。
+# 過去結果に合わせて最適化した値ではなく、検証ログが溜まってから
+# 調整する前提の暫定値。
+HEAD_TEMP=12.0
+SECOND_TEMP=15.0
+THIRD_TEMP=15.0
+
+# EV_MIN: モデルEV(推定確率×オッズ)がこの倍率以上の時だけEV候補とする。
+# 1.05 = モデルEVが+5%以上。検証用なので極端に高くしていない。
+EV_MIN=1.05
+
+EV_LOG_FILE=os.path.join(VERIFY_DIR,"ev_verify_log.jsonl")
 
 
 def parse_odds3t(src):
@@ -516,71 +555,184 @@ def fetch_odds3t(jcd,hd,rno):
     return parse_odds3t(src),url
 
 
-def harville_trifecta_probs(strengths):
-    """strengths: {艇番(int): 強さ} -> {"a-b-c": 確率} の全120通り"""
-    total=sum(strengths.values())
+def softmax_dict(scores, temperature):
+    """{lane: score} -> {lane: 確率(合計1.0)}。オーバーフロー防止のため最大値を引いてから指数化する。"""
+    if not scores:
+        return {}
+    max_s=max(scores.values())
+    exps={k:math.exp((v-max_s)/temperature) for k,v in scores.items()}
+    total=sum(exps.values())
+    if total<=0:
+        n=len(scores)
+        return {k:1.0/n for k in scores}
+    return {k:v/total for k,v in exps.items()}
+
+
+def estimated_trifecta_probs(ranked):
+    """OTA本体のhead_score(1着適性)・second_score(2着適性)・third_score(3着適性)を
+    使って3連単120通りの「推定確率」を作る。
+
+    P(A-B-C) = P(Aが1着) × P(Bが2着|A除外) × P(Cが3着|A,B除外)
+    という条件付き確率の形にしており、それぞれの段階で残っている艇だけを
+    対象に個別にSoftmax変換(再正規化)している。これにより120通りの合計は
+    数学的に必ず1.0になる(浮動小数点誤差を除く)。
+
+    これはOTA本体のスコアリング(head_score等)を一切変更せず、EV機能側だけで
+    それらのスコアの「使い方」を変えているだけであることに注意。
+    """
+    head_scores={r["lane"]:r.get("head_score",0.0) for r in ranked}
+    second_scores={r["lane"]:r.get("second_score",0.0) for r in ranked}
+    third_scores={r["lane"]:r.get("third_score",0.0) for r in ranked}
+    lanes=list(head_scores.keys())
+
+    p1=softmax_dict(head_scores,HEAD_TEMP)
+
     probs={}
-    if total<=0:return probs
-    boats=list(strengths.keys())
-    for a,b,c in itertools.permutations(boats,3):
-        s_a,s_b,s_c=strengths[a],strengths[b],strengths[c]
-        d2=total-s_a;d3=total-s_a-s_b
-        if d2<=0 or d3<=0:continue
-        probs[f"{a}-{b}-{c}"]=(s_a/total)*(s_b/d2)*(s_c/d3)
-    return probs
+    debug={}
+    for a in lanes:
+        remaining2={k:v for k,v in second_scores.items() if k!=a}
+        p2=softmax_dict(remaining2,SECOND_TEMP)
+        for b in lanes:
+            if b==a:continue
+            remaining3={k:v for k,v in third_scores.items() if k not in (a,b)}
+            p3=softmax_dict(remaining3,THIRD_TEMP)
+            for c in lanes:
+                if c in (a,b):continue
+                combo=f"{a}-{b}-{c}"
+                prob=p1[a]*p2[b]*p3[c]
+                probs[combo]=prob
+                debug[combo]={
+                    "head_score_a":head_scores[a],"p1_a":p1[a],
+                    "second_score_b":second_scores[b],"p2_b_given_a":p2[b],
+                    "third_score_c":third_scores[c],"p3_c_given_ab":p3[c],
+                }
+    return probs,debug
 
 
-def strengths_from_head_score(ranked):
-    """本体score_racersのhead_scoreをそのまま「強さ」として使う。
-    head_scoreは0-100スケールの正の値なので、そのままHarville法の
-    入力として使える(相対比だけが意味を持つ)。"""
-    strengths={}
-    for r in ranked:
-        v=r.get("head_score",0.0)
-        strengths[r["lane"]]=max(0.01,float(v))
-    return strengths
-
-
-def compute_ev_table(probs,odds,ev_threshold_pct,bet_amount=100):
+def compute_ev_table(probs,debug,odds,ev_min,bets):
+    """probs: {combo: 推定確率}, debug: {combo: 内訳}, odds: {combo: オッズ}
+    bets: 既存OTAの上位7点(順序付き)。EV候補が既存7点の何位に相当するかを
+    付記するためだけに使う(比較表示用で、選定ロジックには影響しない)。"""
+    bets_index={b:i+1 for i,b in enumerate(bets)}  # 1始まりの順位
     rows=[]
     for combo,p in probs.items():
         o=odds.get(combo)
         if o is None:continue
-        ev_pct=(p*o-1.0)*100.0
-        rows.append({"combo":combo,"model_prob_pct":round(p*100.0,2),"odds":o,"ev_pct":round(ev_pct,1)})
-    rows.sort(key=lambda r:r["ev_pct"],reverse=True)
+        model_ev=p*o  # 倍率(1.05 = +5%)
+        d=debug.get(combo,{})
+        rows.append({
+            "combo":combo,
+            "estimated_prob_pct":round(p*100.0,4),
+            "odds":o,
+            "model_ev":round(model_ev,4),
+            "model_ev_pct":round((model_ev-1.0)*100.0,2),
+            "ota_rank":bets_index.get(combo),  # Noneなら既存7点に含まれない
+            "debug":{
+                "head_score_a":round(d.get("head_score_a",0.0),2),
+                "p1_a":round(d.get("p1_a",0.0),6),
+                "second_score_b":round(d.get("second_score_b",0.0),2),
+                "p2_b_given_a":round(d.get("p2_b_given_a",0.0),6),
+                "third_score_c":round(d.get("third_score_c",0.0),2),
+                "p3_c_given_ab":round(d.get("p3_c_given_ab",0.0),6),
+            },
+        })
+    rows.sort(key=lambda r:r["model_ev"],reverse=True)
 
     if len(odds)<MIN_ODDS_COVERAGE:
         candidates=[]
     else:
-        candidates=[r for r in rows if r["ev_pct"]>=ev_threshold_pct]
+        candidates=[r for r in rows if r["model_ev"]>=ev_min]
     return rows,candidates
 
 
-def compute_ev(ranked,jcd,hd,rno,ev_threshold_pct=DEFAULT_EV_THRESHOLD):
-    """本体のhead_scoreを確率化し、実オッズと突き合わせてEV判定する。
+def ev_log_write(record):
+    """EV検証用ログをJSONLで1行追記する。書き込みに失敗しても例外を
+    投げない(ログはあくまで検証用の副産物であり、本体機能を止めない)。"""
+    try:
+        with open(EV_LOG_FILE,"a",encoding=ENC_NAME) as f:
+            f.write(json.dumps(record,ensure_ascii=False)+"\n")
+    except Exception as e:
+        print("EVログ書き込みエラー:",e)
+
+
+def compute_ev(ranked,bets,confidence,before,jcd,hd,rno,ev_min=EV_MIN):
+    """OTA本体のhead_score/second_score/third_scoreを使い、着順ごとに
+    独立したSoftmaxで推定確率を作り、実オッズと突き合わせてEV判定する。
     オッズ取得に失敗しても例外を投げず、理由を付けて空の結果を返す
     (EVはあくまで追加情報であり、本体の予想表示自体は止めたくないため)。"""
     try:
         odds,odds_url=fetch_odds3t(jcd,hd,rno)
     except Exception as e:
-        return {"available":False,"reason":f"オッズ取得に失敗しました: {e}",
-                "odds_count":0,"ranking":[],"candidates":[]}
+        odds,odds_url=None,None
+        ev_result={"available":False,"reason":f"オッズ取得に失敗しました: {e}",
+                   "odds_count":0,"ranking":[],"candidates":[],"ev_top2":[]}
+        ev_log_write({
+            "logged_at":datetime.datetime.now().isoformat(timespec="seconds"),
+            "date":hd,"venue_code":jcd,"race":int(rno),
+            "confidence":confidence,
+            "wind_speed":before.get("wind_speed"),"wave_height":before.get("wave_height"),
+            "stable_board":before.get("stable_board"),
+            "ota_bets":bets,
+            "ev_available":False,"ev_error":str(e),
+            "ev_candidates":[],
+        })
+        return ev_result
 
-    strengths=strengths_from_head_score(ranked)
-    probs=harville_trifecta_probs(strengths)
-    ranking,candidates=compute_ev_table(probs,odds,ev_threshold_pct)
+    probs,debug=estimated_trifecta_probs(ranked)
+
+    # 合計が1.0付近になっているかの自己チェック(バグ検知用)。
+    # ここが大きくズレる場合はconsole/ログで検知できるようにしておく。
+    prob_sum=sum(probs.values())
+    if abs(prob_sum-1.0)>0.01:
+        print(f"[EV警告] 推定確率の合計が1.0から乖離しています: {prob_sum}")
+
+    ranking,candidates=compute_ev_table(probs,debug,odds,ev_min,bets)
 
     reason=None
     if len(odds)<MIN_ODDS_COVERAGE:
         reason=f"オッズ取得件数が{len(odds)}/120と不十分なため、EV候補は非表示にしています(数字自体は信用できません)。"
 
-    return {"available":True,"reason":reason,"odds_count":len(odds),"odds_url":odds_url,
-            "ev_threshold_pct":ev_threshold_pct,"ranking":ranking[:15],"candidates":candidates}
+    # 異常なモデルEVが大量発生していないかの簡易チェック(確率モデル破綻の検知用)
+    extreme=[r for r in ranking if r["model_ev_pct"]>=300]
+    if len(extreme)>=5:
+        print(f"[EV警告] モデルEV+300%以上が{len(extreme)}件。確率モデルの異常の可能性があります。")
+
+    ev_top2=candidates[:2]
+
+    ev_result={"available":True,"reason":reason,"odds_count":len(odds),"odds_url":odds_url,
+               "ev_min":ev_min,"ranking":ranking[:15],"candidates":candidates,"ev_top2":ev_top2,
+               "prob_sum_check":round(prob_sum,6),
+               "note":"推定確率は統計的に校正済みの真の的中確率ではありません。モデルEVも参考値です。"}
+
+    ev_log_write({
+        "logged_at":datetime.datetime.now().isoformat(timespec="seconds"),
+        "date":hd,"venue_code":jcd,"race":int(rno),
+        "confidence":confidence,
+        "wind_speed":before.get("wind_speed"),"wave_height":before.get("wave_height"),
+        "stable_board":before.get("stable_board"),
+        "ota_bets":bets,
+        "racers_scores":[{"lane":r["lane"],"head_score":r.get("head_score"),
+                           "second_score":r.get("second_score"),"third_score":r.get("third_score")}
+                          for r in sorted(ranked,key=lambda x:x["lane"])],
+        "odds_count":len(odds),"prob_sum_check":round(prob_sum,6),
+        "ev_available":True,
+        "ev_candidates":[{
+            "rank":i+1,"combo":r["combo"],"estimated_prob_pct":r["estimated_prob_pct"],
+            "odds":r["odds"],"model_ev":r["model_ev"],"model_ev_pct":r["model_ev_pct"],
+            "ota_rank":r["ota_rank"],
+        } for i,r in enumerate(ev_top2)],
+        # 結果はまだ分からないのでnullで確保しておき、後から/api/verify/updateに
+        # 相当する仕組みで埋める前提の枠だけ用意しておく。
+        "result":None,"hit_ev_rank":None,"payout_100":None,
+    })
+
+    return ev_result
 
 
-def analyze(jcd,rno,hd,ev_threshold=5.0):
-    key=f"{hd}:{jcd}:{rno}:{ev_threshold}";now=time.time();cached=CACHE.get(key)
+def analyze(jcd,rno,hd,ev_min=EV_MIN,include_ev=False):
+    # 通常版とEV版はキャッシュを分離。通常版ではオッズ取得/EV計算をしない。
+    mode="ev" if include_ev else "normal"
+    key=f"{hd}:{jcd}:{rno}:{mode}:{ev_min if include_ev else '-'}";now=time.time();cached=CACHE.get(key)
     if cached and now-cached["time"]<=CACHE_SECONDS:
         data=dict(cached["data"]);data["cached"]=True;return data
     racers=parse_racelist(http_get(make_url("racelist",hd,jcd,rno)))
@@ -588,7 +740,6 @@ def analyze(jcd,rno,hd,ev_threshold=5.0):
     racers=merge_data(racers,before)
     if len(racers)<3:raise RuntimeError("出走表を取得できません。未開催・公開前・HTML変更の可能性があります。")
     ranked=score_racers(racers,before);judge,confidence,notes=race_judgement(ranked,before);bets=generate_bets(ranked,7)
-    ev=compute_ev(ranked,jcd,hd,rno,ev_threshold_pct=ev_threshold)
     result={"app_version":APP_VERSION,"venue_code":jcd,"venue":VENUES[jcd],"race":int(rno),"date":hd,
             "judge":judge,"confidence":confidence,"coverage":round(data_coverage(ranked,before)*100,1),
             "notes":notes,"bets":bets,"weather":before,"racers":sorted(ranked,key=lambda x:x["lane"]),
@@ -596,7 +747,9 @@ def analyze(jcd,rno,hd,ev_threshold=5.0):
             "head_rank":[r["lane"] for r in sorted(ranked,key=lambda x:x["head_score"],reverse=True)],
             "second_rank":[r["lane"] for r in sorted(ranked,key=lambda x:x["second_score"],reverse=True)],
             "third_rank":[r["lane"] for r in sorted(ranked,key=lambda x:x["third_score"],reverse=True)],
-            "ev":ev,"cached":False}
+            "cached":False}
+    if include_ev:
+        result["ev"]=compute_ev(ranked,bets,confidence,before,jcd,hd,rno,ev_min=ev_min)
     CACHE[key]={"time":now,"data":result};return result
 
 def supabase_enabled():
@@ -692,31 +845,33 @@ def save_analysis_log(data):
     logs=load_logs()
     key=f"{data['date']}:{str(data['venue_code']).zfill(2)}:{int(data['race'])}"
     old=next((x for x in logs if x.get("key")==key),None)
-
     rec={
-        "key":key,
-        "saved_at":datetime.datetime.now().isoformat(timespec="seconds"),
-        "app_version":data.get("app_version",""),
-        "date":data["date"],
-        "venue_code":str(data["venue_code"]).zfill(2),
-        "venue":data.get("venue",""),
-        "race":int(data["race"]),
-        "judge":data.get("judge",""),
-        "confidence":int(data.get("confidence",0) or 0),
-        "coverage":float(data.get("coverage",0) or 0),
-        "bets":list(data.get("bets") or [])[:7],
-        "result":None,
-        "payout_100":None,
-        "result_status":"pending",
-        "hit_rank":None
-    }
-
-    if old and old.get("result"):
-        for k in ("result","payout_100","result_status","hit_rank","result_checked_at"):
-            rec[k]=old.get(k)
-
-    if supabase_enabled():
-        save_logs([rec])
+        "key":key,"saved_at":datetime.datetime.now().isoformat(timespec="seconds"),
+        "app_version":data.get("app_version",""),"date":data["date"],
+        "venue_code":str(data["venue_code"]).zfill(2),"venue":data.get("venue",""),
+        "race":int(data["race"]),"judge":data.get("judge",""),
+        "confidence":int(data.get("confidence",0) or 0),"coverage":float(data.get("coverage",0) or 0),
+        "bets":list(data.get("bets") or [])[:7],"result":None,"payout_100":None,
+        "result_status":"pending","hit_rank":None}
+    ev=data.get("ev")
+    if isinstance(ev,dict):
+        rec["ev_saved_at"]=datetime.datetime.now().isoformat(timespec="seconds")
+        rec["ev_model_version"]=APP_VERSION;rec["ev_min"]=ev.get("ev_min")
+        rec["ev_odds_count"]=ev.get("odds_count",0);rec["ev_prob_sum_check"]=ev.get("prob_sum_check")
+        rec["ev_candidates"]=list(ev.get("ev_top2") or [])[:2];rec["ev_available"]=bool(ev.get("available"))
+        rec["ev_reason"]=ev.get("reason")
+    if old:
+        for k in ("result","payout_100","result_status","hit_rank","result_checked_at","hit_ev_rank"):
+            if old.get(k) is not None:rec[k]=old.get(k)
+        if "ev" not in data:
+            for k in ("ev_saved_at","ev_model_version","ev_min","ev_odds_count","ev_prob_sum_check","ev_candidates","ev_available","ev_reason","hit_ev_rank"):
+                if k in old:rec[k]=old.get(k)
+    if rec.get("result") and rec.get("ev_candidates"):
+        try:
+            combos=[x.get("combo") for x in rec.get("ev_candidates",[])]
+            rec["hit_ev_rank"]=combos.index(rec["result"])+1 if rec["result"] in combos else None
+        except Exception:rec["hit_ev_rank"]=None
+    if supabase_enabled():save_logs([rec])
     else:
         logs=[rec if x.get("key")==key else x for x in logs] if old else logs+[rec]
         logs.sort(key=lambda x:(x.get("date",""),x.get("venue_code",""),int(x.get("race",0))))
@@ -811,7 +966,11 @@ def update_results(limit=VERIFY_UPDATE_LIMIT):
                     rec["hit_rank"]=(rec.get("bets") or []).index(rec["result"])+1
                 except ValueError:
                     rec["hit_rank"]=None
-
+                try:
+                    ev_combos=[x.get("combo") for x in (rec.get("ev_candidates") or [])]
+                    rec["hit_ev_rank"]=ev_combos.index(rec["result"])+1 if rec["result"] in ev_combos else None
+                except Exception:
+                    rec["hit_ev_rank"]=None
                 updated+=1
             else:
                 rec["result_status"]="pending"
@@ -862,6 +1021,41 @@ def stats(stake=200):
             b=calc_bucket(sub,2,stake);bands.append({"band":label,"races":len(sub),"hit_rate":b["hit_rate"],"return_rate":b["return_rate"],"profit":b["profit"]})
     return {"total_saved":len(logs),"completed":len(done),"pending":len(logs)-len(done),"buckets":buckets,"venues":venues,"confidence_bands":bands}
 
+
+def calc_ev_bucket(records,stake=VERIFY_STAKE_YEN):
+    done=[r for r in records if r.get("result_status")=="done" and r.get("result") and r.get("ev_candidates")]
+    races=len(done);tickets=sum(len(r.get("ev_candidates") or []) for r in done);investment=tickets*stake;hits=0;payout=0
+    for r in done:
+        if r.get("hit_ev_rank"):
+            hits+=1;payout+=int(round((r.get("payout_100") or 0)*(stake/100)))
+    return {"races":races,"tickets":tickets,"hits":hits,"hit_rate":round(hits/races*100,2) if races else 0,
+            "investment":investment,"payout":payout,"profit":payout-investment,
+            "return_rate":round(payout/investment*100,2) if investment else 0}
+
+def ev_stats(stake=VERIFY_STAKE_YEN):
+    logs=load_logs();done=[r for r in logs if r.get("result_status")=="done" and r.get("result") and r.get("ev_candidates")]
+    overall=calc_ev_bucket(done,stake)
+    tickets=[]
+    for r in done:
+        for c in (r.get("ev_candidates") or []):
+            mev=to_float(c.get("model_ev"),None)
+            if mev is not None:tickets.append({"model_ev":mev,"hit":c.get("combo")==r.get("result"),"payout_100":r.get("payout_100") or 0})
+    bands=[]
+    for label,lo,hi in [("105-120%",1.05,1.20),("120-150%",1.20,1.50),("150-200%",1.50,2.00),("200%以上",2.00,None)]:
+        sub=[x for x in tickets if x["model_ev"]>=lo and (hi is None or x["model_ev"]<hi)];inv=len(sub)*stake
+        hit=sum(1 for x in sub if x["hit"]);pay=sum(int(round(x["payout_100"]*(stake/100))) for x in sub if x["hit"])
+        bands.append({"band":label,"tickets":len(sub),"hits":hit,"hit_rate":round(hit/len(sub)*100,2) if sub else 0,
+                      "investment":inv,"payout":pay,"profit":pay-inv,"return_rate":round(pay/inv*100,2) if inv else 0})
+    venues=[]
+    for code,name in VENUES.items():
+        sub=[r for r in done if r.get("venue_code")==code]
+        if sub:
+            b=calc_ev_bucket(sub,stake);b.update({"venue_code":code,"venue":name});venues.append(b)
+    venues.sort(key=lambda x:(x["return_rate"],x["races"]),reverse=True)
+    return {"saved_ev_races":sum(1 for r in logs if r.get("ev_candidates")),"completed_ev_races":len(done),
+            "pending_ev_races":sum(1 for r in logs if r.get("ev_candidates") and r.get("result_status")!="done"),
+            "stake_per_ticket":stake,"overall":overall,"bands":bands,"venues":venues}
+
 @app.route("/")
 def index():
     today=datetime.datetime.now().strftime("%Y%m%d")
@@ -870,14 +1064,31 @@ def index():
 @app.route("/api/analyze")
 def api_analyze():
     try:
-        jcd=str(request.args.get("jcd","18")).zfill(2);rno=int(request.args.get("rno","1"))
-        hd=request.args.get("hd") or datetime.datetime.now().strftime("%Y%m%d")
-        ev_threshold=to_float(request.args.get("ev_threshold"),DEFAULT_EV_THRESHOLD)
+        jcd=str(request.args.get("jcd","18")).zfill(2);rno=int(request.args.get("rno","1"));hd=request.args.get("hd") or datetime.datetime.now().strftime("%Y%m%d")
         if jcd not in VENUES:return jsonify({"ok":False,"error":"場コードが不正です"}),400
         if not 1<=rno<=12:return jsonify({"ok":False,"error":"レース番号は1～12です"}),400
-        data=analyze(jcd,rno,hd,ev_threshold=ev_threshold);save_analysis_log(data)
-        return jsonify({"ok":True,"data":data})
+        data=analyze(jcd,rno,hd,include_ev=False);save_analysis_log(data);return jsonify({"ok":True,"data":data})
     except Exception as e:return jsonify({"ok":False,"error":str(e)}),500
+
+@app.route("/api/ev/analyze")
+@ev_login_required
+def api_ev_analyze():
+    try:
+        jcd=str(request.args.get("jcd","18")).zfill(2);rno=int(request.args.get("rno","1"));hd=request.args.get("hd") or datetime.datetime.now().strftime("%Y%m%d");ev_min=to_float(request.args.get("ev_min"),EV_MIN)
+        if jcd not in VENUES:return jsonify({"ok":False,"error":"場コードが不正です"}),400
+        if not 1<=rno<=12:return jsonify({"ok":False,"error":"レース番号は1～12です"}),400
+        data=analyze(jcd,rno,hd,ev_min=ev_min,include_ev=True);save_analysis_log(data);return jsonify({"ok":True,"data":data})
+    except Exception as e:return jsonify({"ok":False,"error":str(e)}),500
+
+@app.route("/api/ev/stats")
+@ev_login_required
+def api_ev_stats():return jsonify({"ok":True,"stats":ev_stats(VERIFY_STAKE_YEN)})
+
+@app.route("/api/ev/update",methods=["GET","POST"])
+@ev_login_required
+def api_ev_update():
+    c,u,remaining,error_count=update_results(VERIFY_UPDATE_LIMIT)
+    return jsonify({"ok":True,"checked":c,"updated":u,"remaining":remaining,"errors":error_count,"limit":VERIFY_UPDATE_LIMIT})
 
 @app.route("/api/verify/update",methods=["GET","POST"])
 def verify_update():
@@ -903,6 +1114,44 @@ def verify_storage():
         "persistent":bool(supabase_enabled()),
         "table":SUPABASE_TABLE if supabase_enabled() else None
     })
+
+
+@app.route("/ev/login",methods=["GET","POST"])
+def ev_login():
+    if ev_auth_ok():return redirect(url_for("ev_page"))
+    error=""
+    if request.method=="POST":
+        if not EV_PASSWORD:error="RenderのEnvironmentに EV_PASSWORD が設定されていません。"
+        elif hmac.compare_digest(str(request.form.get("password","")),str(EV_PASSWORD)):
+            session.clear();session["ev_auth"]=True;session.permanent=True
+            nxt=request.form.get("next") or url_for("ev_page")
+            if not str(nxt).startswith("/"):nxt=url_for("ev_page")
+            return redirect(nxt)
+        else:error="パスワードが違います。"
+    nxt=request.args.get("next") or url_for("ev_page")
+    err_html=("<p class='e'>"+html.escape(error)+"</p>") if error else ""
+    page="""<!doctype html><html lang='ja'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>OTA EV Login</title><style>body{font-family:-apple-system,sans-serif;background:#0d1420;color:#fff;margin:0}.w{max-width:420px;margin:70px auto;padding:20px}.c{background:#182233;border-radius:18px;padding:22px}input,button{box-sizing:border-box;width:100%;padding:14px;border-radius:12px;font-size:17px}input{border:1px solid #526174;background:#fff;color:#111;margin:12px 0}button{border:0;background:#2f7df6;color:#fff;font-weight:700}.e{color:#ff9b9b}.s{color:#aeb9c8;font-size:13px;line-height:1.5}</style></head><body><div class='w'><div class='c'><h2>🔐 OTA EV 専用</h2><p class='s'>一度ログインすると、このiPhoneでは最大__DAYS__日間ログイン状態を保持します。</p>__ERR__<form method='post'><input type='hidden' name='next' value='__NEXT__'><input name='password' type='password' autocomplete='current-password' placeholder='EV専用パスワード' required><button type='submit'>EVモードを開く</button></form></div></div></body></html>"""
+    page=page.replace("__DAYS__",str(EV_LOGIN_DAYS)).replace("__ERR__",err_html).replace("__NEXT__",html.escape(str(nxt)))
+    return Response(page,mimetype="text/html")
+
+@app.route("/ev/logout")
+def ev_logout():session.clear();return redirect(url_for("ev_login"))
+
+@app.route("/ev")
+@ev_login_required
+def ev_page():
+    today=datetime.datetime.now().strftime("%Y%m%d")
+    opts=''.join(f'<option value="{c}">{c} {html.escape(n)}</option>' for c,n in VENUES.items())
+    races=''.join(f'<option value="{i}">{i}R</option>' for i in range(1,13))
+    page="""<!doctype html><html lang='ja'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>OTA QUICK SNIPER EV</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;background:#0c111a;color:#edf3ff;margin:0}.w{max-width:940px;margin:auto;padding:14px}.c{background:#151e2c;border:1px solid #263247;border-radius:16px;padding:14px;margin:12px 0}h2,h3{margin:6px 0 12px}select,input,button{font-size:16px;border-radius:10px;padding:11px}select,input{background:#fff;color:#111;border:0}button{border:0;background:#2f7df6;color:#fff;font-weight:700}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row>*{flex:1;min-width:110px}.muted{color:#aab7c9;font-size:13px}.bets{font-size:22px;font-weight:800;letter-spacing:.5px}.ev{font-size:18px;font-weight:800}.good{color:#6fe39c}.bad{color:#ff8a8a}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:8px;border-bottom:1px solid #2a3548;text-align:right}th:first-child,td:first-child{text-align:left}a{color:#8eb9ff}#msg{white-space:pre-wrap}@media(max-width:600px){.row>*{min-width:46%}.bets{font-size:20px}}</style></head><body><div class='w'><div class='row'><h2 style='flex:3'>🚤 OTA QUICK SNIPER <span style='color:#67d4ff'>EV専用</span></h2><a href='/ev/logout' style='flex:0;white-space:nowrap'>ログアウト</a></div><div class='c'><div class='row'><select id='jcd'>__OPTS__</select><input id='hd' value='__TODAY__' inputmode='numeric' maxlength='8'><select id='rno'>__RACES__</select><input id='evmin' value='__EVMIN__' inputmode='decimal'><button onclick='go()'>解析</button></div><p class='muted'>EV閾値は倍率。1.05=モデルEV +5%以上。通常OTAロジックは変更しません。</p><div id='msg'></div></div><div class='c'><h3>通常OTA</h3><div id='normal'>まだ解析していません。</div></div><div class='c'><h3>EV TOP2（検証中）</h3><div id='evbox'>まだ解析していません。</div><p class='muted'>※モデルEVは校正済みの真の期待値ではありません。実績との相関を検証するための値です。</p></div><div class='c'><div class='row'><h3 style='flex:3'>EV検証</h3><button onclick='upd()' style='flex:1'>公式結果を更新</button></div><div id='sum'>読み込み中...</div><h4>EV帯別</h4><table><thead><tr><th>モデルEV</th><th>券数</th><th>的中率</th><th>回収率</th><th>収支</th></tr></thead><tbody id='bands'></tbody></table><h4>会場別</h4><table><thead><tr><th>会場</th><th>R</th><th>的中率</th><th>回収率</th><th>収支</th></tr></thead><tbody id='venues'></tbody></table></div><script>
+const yen=n=>new Intl.NumberFormat('ja-JP').format(n)+'円',pct=n=>Number(n||0).toFixed(1)+'%';
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+async function go(){msg.textContent='解析中...';normal.textContent='';evbox.textContent='';try{const q=new URLSearchParams({jcd:jcd.value,hd:hd.value,rno:rno.value,ev_min:evmin.value});const j=await (await fetch('/api/ev/analyze?'+q)).json();if(!j.ok)throw new Error(j.error||'解析失敗');const d=j.data;msg.textContent=`${d.venue} ${d.race}R / ${d.judge} / 信頼度 ${d.confidence}%`;normal.innerHTML=`<div class='bets'>${d.bets.map((b,i)=>`${i+1}位 ${esc(b)}`).join('　')}</div><p class='muted'>1着順位: ${d.head_rank.join('→')} / 2着順位: ${d.second_rank.join('→')} / 3着順位: ${d.third_rank.join('→')}</p>`;const e=d.ev||{};if(!e.available){evbox.innerHTML=`<span class='bad'>${esc(e.reason||'EV取得不可')}</span>`}else if(!(e.ev_top2||[]).length){evbox.innerHTML=`EV条件を満たす候補なし（オッズ ${e.odds_count}/120）`}else{evbox.innerHTML=e.ev_top2.map((x,i)=>`<div class='ev'>${i+1}位 ${esc(x.combo)}　推定確率 ${x.estimated_prob_pct}%　オッズ ${x.odds}倍　<span class='${x.model_ev>=1?'good':'bad'}'>モデルEV ${(x.model_ev*100).toFixed(1)}%</span>　${x.ota_rank?'OTA通常'+x.ota_rank+'位':'OTA通常7点外'}</div>`).join('<hr style="border-color:#2a3548">')}await loadStats()}catch(e){msg.textContent='エラー: '+e.message}}
+async function loadStats(){const j=await (await fetch('/api/ev/stats')).json();if(!j.ok)return;const s=j.stats,o=s.overall;sum.innerHTML=`保存EVレース <b>${s.saved_ev_races}</b> / 結果確定 <b>${s.completed_ev_races}</b> / 待ち <b>${s.pending_ev_races}</b><br>EV TOP候補全体: ${o.races}R・${o.tickets}券 / 的中率 ${pct(o.hit_rate)} / 回収率 <b class='${o.return_rate>=100?'good':'bad'}'>${pct(o.return_rate)}</b> / 収支 ${yen(o.profit)}`;bands.innerHTML=s.bands.map(b=>`<tr><td>${b.band}</td><td>${b.tickets}</td><td>${pct(b.hit_rate)}</td><td class='${b.return_rate>=100?'good':'bad'}'>${pct(b.return_rate)}</td><td>${yen(b.profit)}</td></tr>`).join('');venues.innerHTML=s.venues.map(v=>`<tr><td>${v.venue}</td><td>${v.races}</td><td>${pct(v.hit_rate)}</td><td class='${v.return_rate>=100?'good':'bad'}'>${pct(v.return_rate)}</td><td>${yen(v.profit)}</td></tr>`).join('')}
+async function upd(){msg.textContent='公式結果を最大20R更新中...';const j=await (await fetch('/api/ev/update',{method:'POST'})).json();msg.textContent=j.ok?`確認${j.checked}R / 新規確定${j.updated}R / 残り${j.remaining}R`:(j.error||'更新失敗');await loadStats()}
+loadStats();</script></div></body></html>"""
+    page=page.replace("__OPTS__",opts).replace("__TODAY__",today).replace("__RACES__",races).replace("__EVMIN__",f"{EV_MIN:.2f}")
+    return Response(page,mimetype="text/html")
 
 @app.route("/verify")
 def verify_page():
