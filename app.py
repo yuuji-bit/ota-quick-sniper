@@ -9,7 +9,7 @@ from urllib.request import Request,urlopen
 from urllib.parse import urlencode
 from flask import Flask,render_template,request,jsonify,Response,session,redirect,url_for
 
-APP_VERSION="1.9.0 EV-PRIVATE+VERIFY"
+APP_VERSION="1.9.1 EV-PRIVATE+VERIFY+ODDSFIX"
 APP_NAME="OTA QUICK SNIPER"
 BASE_URL="https://www.boatrace.jp/owpc/pc/race"
 TIMEOUT=15
@@ -496,57 +496,117 @@ EV_LOG_FILE=os.path.join(VERIFY_DIR,"ev_verify_log.jsonl")
 
 
 def parse_odds3t(src):
-    """3連単オッズページから { "a-b-c": オッズ } を抽出する。
-    本体のextract_rows/extract_cellsをそのまま使い、新規の依存を増やさない。
+    """3連単オッズページから {"a-b-c": オッズ} を抽出する。
 
-    v1.7.1 EV fix: 実際に取得したデータで検証したところ、1行(<tr>)の中に
-    複数の「組番+オッズ」の組が横に並ぶ表組みだったため、1行につき最初の
-    1件しか拾えず120通り中10通りしか取得できないバグがあった。
-    finditerで行内の組番出現位置を全部走査し、それぞれの直後にある
-    オッズらしき数値を個別に対応付ける方式に変更する。"""
-    odds={}
-    combo_re=re.compile(r"\b([1-6])\s*[-－]\s*([1-6])\s*[-－]\s*([1-6])\b")
-    odds_re=re.compile(r"\b(\d{1,4}(?:\.\d)?)\b")
+    BOAT RACE公式の3連単表は、1着1〜6号艇の6ブロックが横並びで、
+    各2着候補ごとに4行ずつ3着候補が並ぶ特殊な rowspan 表になっている。
+    そのため画面上の文字列には「1-2-3」の組番が120通り明示されない。
 
-    for row_html in extract_rows(src or ""):
-        text=normalize_space(strip_tags(row_html))
+    v1.9.1:
+      1) 公式表の rowspan 構造を行単位で復元する matrix parser を最優先
+      2) 従来の「1-2-3」表記 parser をフォールバックとして併用
+    とし、取得件数が多い方を採用する。
+    """
 
-        matches=list(combo_re.finditer(text))
-        if not matches:
-            # 組番がテキスト中で「1-2-3」のような形になっていない
-            # (セル区切りのみの)ケースへのフォールバック
+    def valid_boat(v):
+        return v is not None and 1 <= v <= 6
+
+    def parse_matrix_rows(html_src):
+        """公式PC版の6列並列・rowspan表を復元する。
+
+        1つの2着候補は4行で構成される。
+          先頭行: [2着, 3着, オッズ] × 6ブロック = 18セル
+          続く3行: [3着, オッズ] × 6ブロック = 12セル
+        これが5ブロック(計20行)続くので120通りになる。
+        """
+        rows=[]
+        for row_html in extract_rows(html_src or ""):
             cells=extract_cells(row_html)
-            nums=[c for c in cells if c.isdigit() and 1<=int(c)<=6]
-            if len(nums)>=3:
-                a,b,c=nums[0],nums[1],nums[2]
-                if a!=b and b!=c and a!=c:
-                    m_odds=odds_re.findall(text)
-                    for om in reversed(m_odds):
-                        v=to_float(om,None)
-                        if v is not None and v>=1.0:
-                            odds[f"{a}-{b}-{c}"]=v;break
-            continue
-
-        # 行内に複数の組番が並ぶケース: 各組番の出現位置から次の組番の
-        # 出現位置(または行末)までの範囲だけを見て、その中の最初の
-        # オッズらしき数値をその組番に対応付ける。
-        for i,m in enumerate(matches):
-            a,b,c=m.groups()
-            if a==b or b==c or a==c:
+            # 公式表以外の行を除外。rowspanの影響で基本18セル/12セル。
+            if len(cells) not in (12,18):
                 continue
-            combo=f"{a}-{b}-{c}"
-            start=m.end()
-            end=matches[i+1].start() if i+1<len(matches) else len(text)
-            segment=text[start:end]
-            odds_val=None
-            for om in odds_re.findall(segment):
-                v=to_float(om,None)
-                if v is not None and v>=1.0:
-                    odds_val=v;break
-            if odds_val is not None:
-                odds[combo]=odds_val
+            rows.append(cells)
 
-    return odds
+        best={}
+        # ページ内に他の12/18セル表が混じっても、20行窓で整合性を判定。
+        for st in range(0, max(0, len(rows)-19)):
+            window=rows[st:st+20]
+            if len(window)<20:
+                continue
+            candidate={}
+            second_state={a:None for a in range(1,7)}
+            ok=True
+
+            for r_idx,cells in enumerate(window):
+                first_of_group=(r_idx % 4 == 0)
+                expected=18 if first_of_group else 12
+                if len(cells)!=expected:
+                    ok=False;break
+
+                chunk=3 if first_of_group else 2
+                for col,a in enumerate(range(1,7)):
+                    part=cells[col*chunk:(col+1)*chunk]
+                    if first_of_group:
+                        b=to_int(part[0],None)
+                        c=to_int(part[1],None)
+                        odd=to_float(part[2],None)
+                        if not (valid_boat(b) and valid_boat(c)):
+                            ok=False;break
+                        second_state[a]=b
+                    else:
+                        b=second_state[a]
+                        c=to_int(part[0],None)
+                        odd=to_float(part[1],None)
+                        if not (valid_boat(b) and valid_boat(c)):
+                            ok=False;break
+
+                    # 同一艇重複は3連単として不正。
+                    if a==b or a==c or b==c:
+                        ok=False;break
+
+                    # 発売前/欠損は '-' 等になるので、その組だけ未登録にする。
+                    if odd is not None and odd >= 1.0:
+                        candidate[f"{a}-{b}-{c}"]=odd
+                if not ok:
+                    break
+
+            # 120通り全部の組番構造が一意に生成できる窓だけ有力候補。
+            if ok and len(candidate)>len(best):
+                best=candidate
+                if len(best)>=120:
+                    break
+        return best
+
+    def parse_explicit_combos(html_src):
+        """旧形式/別HTML向けフォールバック。明示的な1-2-3表記を拾う。"""
+        odds={}
+        combo_re=re.compile(r"\b([1-6])\s*[-－]\s*([1-6])\s*[-－]\s*([1-6])\b")
+        odds_re=re.compile(r"\b(\d{1,5}(?:\.\d)?)\b")
+
+        for row_html in extract_rows(html_src or ""):
+            text=normalize_space(strip_tags(row_html))
+            matches=list(combo_re.finditer(text))
+            if not matches:
+                continue
+            for i,m in enumerate(matches):
+                a,b,c=m.groups()
+                if a==b or b==c or a==c:
+                    continue
+                start=m.end()
+                end=matches[i+1].start() if i+1<len(matches) else len(text)
+                segment=text[start:end]
+                for om in odds_re.findall(segment):
+                    v=to_float(om,None)
+                    if v is not None and v>=1.0:
+                        odds[f"{a}-{b}-{c}"]=v
+                        break
+        return odds
+
+    matrix_odds=parse_matrix_rows(src)
+    explicit_odds=parse_explicit_combos(src)
+
+    # 公式PC版ではmatrix_oddsが通常120件。HTML変更時は取得数の多い方を採用。
+    return matrix_odds if len(matrix_odds)>=len(explicit_odds) else explicit_odds
 
 
 def fetch_odds3t(jcd,hd,rno):
