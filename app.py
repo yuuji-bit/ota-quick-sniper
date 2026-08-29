@@ -9,7 +9,7 @@ from urllib.request import Request,urlopen
 from urllib.parse import urlencode
 from flask import Flask,render_template,request,jsonify,Response,session,redirect,url_for
 
-APP_VERSION="1.9.2 EV-PRIVATE+VERIFY+ODDS-DESKTOP-FIX"
+APP_VERSION="1.9.3 EV-CALIBRATION-FUTURE-ONLY"
 APP_NAME="OTA QUICK SNIPER"
 BASE_URL="https://www.boatrace.jp/owpc/pc/race"
 TIMEOUT=15
@@ -484,9 +484,19 @@ DEFAULT_EV_THRESHOLD=5.0  # 後方互換用(旧ev_pct基準)。新方式ではEV
 # Softmaxの温度もそのスケール感に合わせた値を初期値としている。
 # 過去結果に合わせて最適化した値ではなく、検証ログが溜まってから
 # 調整する前提の暫定値。
-HEAD_TEMP=12.0
-SECOND_TEMP=15.0
-THIRD_TEMP=15.0
+# 2026-08-30以降の未来データだけで再検証するEV校正値。
+# 通常OTA本体(head/second/third scoreの算出ロジック)は変更しない。
+HEAD_TEMP=10.0
+SECOND_TEMP=7.0
+THIRD_TEMP=7.0
+
+# model_ev = 推定確率 × オッズ。4.0は表示400%(利益率換算+300%)。
+# 4.0を超える極端な値は、確率過大評価の疑いが強いためEV候補から除外する。
+MODEL_EV_SANITY_CAP=4.0
+
+# 旧パラメータで作ったログを混ぜず、未来データだけで検証するための識別子。
+EV_MODEL_VERSION="EV-CALIB-20260830-T10-7-7-CAP4"
+EV_VALID_FROM_DATE="20260830"
 
 # EV_MIN: モデルEV(推定確率×オッズ)がこの倍率以上の時だけEV候補とする。
 # 1.05 = モデルEVが+5%以上。検証用なので極端に高くしていない。
@@ -767,7 +777,9 @@ def compute_ev_table(probs,debug,odds,ev_min,bets):
     if len(odds)<MIN_ODDS_COVERAGE:
         candidates=[]
     else:
-        candidates=[r for r in rows if r["model_ev"]>=ev_min]
+        # 下限を満たし、かつ極端なモデルEVを除外した範囲だけを候補にする。
+        # 通常OTA7点の生成・順位には一切影響しないEV専用フィルター。
+        candidates=[r for r in rows if r["model_ev"]>=ev_min and r["model_ev"]<=MODEL_EV_SANITY_CAP]
     return rows,candidates
 
 
@@ -817,6 +829,8 @@ def compute_ev(ranked,bets,confidence,before,jcd,hd,rno,ev_min=EV_MIN):
     reason=None
     if len(odds)<MIN_ODDS_COVERAGE:
         reason=f"オッズ取得件数が{len(odds)}/120と不十分なため、EV候補は非表示にしています(数字自体は信用できません)。"
+    elif not candidates and any(r.get("model_ev",0)>MODEL_EV_SANITY_CAP for r in ranking):
+        reason=f"モデルEV {MODEL_EV_SANITY_CAP:.1f}超の極端値を除外したため、採用候補はありません。"
 
     # 異常なモデルEVが大量発生していないかの簡易チェック(確率モデル破綻の検知用)
     extreme=[r for r in ranking if r["model_ev_pct"]>=300]
@@ -826,13 +840,18 @@ def compute_ev(ranked,bets,confidence,before,jcd,hd,rno,ev_min=EV_MIN):
     ev_top2=candidates[:2]
 
     ev_result={"available":True,"reason":reason,"odds_count":len(odds),"odds_url":odds_url,
-               "ev_min":ev_min,"ranking":ranking[:15],"candidates":candidates,"ev_top2":ev_top2,
+               "ev_min":ev_min,"ev_sanity_cap":MODEL_EV_SANITY_CAP,
+               "ev_model_version":EV_MODEL_VERSION,"ev_valid_from":EV_VALID_FROM_DATE,
+               "ranking":ranking[:15],"candidates":candidates,"ev_top2":ev_top2,
                "prob_sum_check":round(prob_sum,6),
                "note":"推定確率は統計的に校正済みの真の的中確率ではありません。モデルEVも参考値です。"}
 
     ev_log_write({
         "logged_at":datetime.datetime.now().isoformat(timespec="seconds"),
         "date":hd,"venue_code":jcd,"race":int(rno),
+        "ev_model_version":EV_MODEL_VERSION,"ev_valid_from":EV_VALID_FROM_DATE,
+        "head_temp":HEAD_TEMP,"second_temp":SECOND_TEMP,"third_temp":THIRD_TEMP,
+        "ev_sanity_cap":MODEL_EV_SANITY_CAP,
         "confidence":confidence,
         "wind_speed":before.get("wind_speed"),"wave_height":before.get("wave_height"),
         "stable_board":before.get("stable_board"),
@@ -982,7 +1001,9 @@ def save_analysis_log(data):
     ev=data.get("ev")
     if isinstance(ev,dict):
         rec["ev_saved_at"]=datetime.datetime.now().isoformat(timespec="seconds")
-        rec["ev_model_version"]=APP_VERSION;rec["ev_min"]=ev.get("ev_min")
+        rec["ev_model_version"]=EV_MODEL_VERSION;rec["ev_valid_from"]=EV_VALID_FROM_DATE
+        rec["ev_head_temp"]=HEAD_TEMP;rec["ev_second_temp"]=SECOND_TEMP;rec["ev_third_temp"]=THIRD_TEMP
+        rec["ev_sanity_cap"]=MODEL_EV_SANITY_CAP;rec["ev_min"]=ev.get("ev_min")
         rec["ev_odds_count"]=ev.get("odds_count",0);rec["ev_prob_sum_check"]=ev.get("prob_sum_check")
         rec["ev_candidates"]=list(ev.get("ev_top2") or [])[:2];rec["ev_available"]=bool(ev.get("available"))
         rec["ev_reason"]=ev.get("reason")
@@ -990,7 +1011,7 @@ def save_analysis_log(data):
         for k in ("result","payout_100","result_status","hit_rank","result_checked_at","hit_ev_rank"):
             if old.get(k) is not None:rec[k]=old.get(k)
         if "ev" not in data:
-            for k in ("ev_saved_at","ev_model_version","ev_min","ev_odds_count","ev_prob_sum_check","ev_candidates","ev_available","ev_reason","hit_ev_rank"):
+            for k in ("ev_saved_at","ev_model_version","ev_valid_from","ev_head_temp","ev_second_temp","ev_third_temp","ev_sanity_cap","ev_min","ev_odds_count","ev_prob_sum_check","ev_candidates","ev_available","ev_reason","hit_ev_rank"):
                 if k in old:rec[k]=old.get(k)
     if rec.get("result") and rec.get("ev_candidates"):
         try:
@@ -1159,7 +1180,11 @@ def calc_ev_bucket(records,stake=VERIFY_STAKE_YEN):
             "return_rate":round(payout/investment*100,2) if investment else 0}
 
 def ev_stats(stake=VERIFY_STAKE_YEN):
-    logs=load_logs();done=[r for r in logs if r.get("result_status")=="done" and r.get("result") and r.get("ev_candidates")]
+    logs=load_logs()
+    # 旧温度/旧EV候補を混ぜると検証不能になるため、2026-08-30以降かつ
+    # 現在のEVモデル識別子で保存されたレースだけを集計する。
+    current_logs=[r for r in logs if str(r.get("date", ""))>=EV_VALID_FROM_DATE and r.get("ev_model_version")==EV_MODEL_VERSION]
+    done=[r for r in current_logs if r.get("result_status")=="done" and r.get("result") and r.get("ev_candidates")]
     overall=calc_ev_bucket(done,stake)
     tickets=[]
     for r in done:
@@ -1167,7 +1192,7 @@ def ev_stats(stake=VERIFY_STAKE_YEN):
             mev=to_float(c.get("model_ev"),None)
             if mev is not None:tickets.append({"model_ev":mev,"hit":c.get("combo")==r.get("result"),"payout_100":r.get("payout_100") or 0})
     bands=[]
-    for label,lo,hi in [("105-120%",1.05,1.20),("120-150%",1.20,1.50),("150-200%",1.50,2.00),("200%以上",2.00,None)]:
+    for label,lo,hi in [("105-120%",1.05,1.20),("120-150%",1.20,1.50),("150-200%",1.50,2.00),("200-400%",2.00,MODEL_EV_SANITY_CAP+1e-12)]:
         sub=[x for x in tickets if x["model_ev"]>=lo and (hi is None or x["model_ev"]<hi)];inv=len(sub)*stake
         hit=sum(1 for x in sub if x["hit"]);pay=sum(int(round(x["payout_100"]*(stake/100))) for x in sub if x["hit"])
         bands.append({"band":label,"tickets":len(sub),"hits":hit,"hit_rate":round(hit/len(sub)*100,2) if sub else 0,
@@ -1178,9 +1203,12 @@ def ev_stats(stake=VERIFY_STAKE_YEN):
         if sub:
             b=calc_ev_bucket(sub,stake);b.update({"venue_code":code,"venue":name});venues.append(b)
     venues.sort(key=lambda x:(x["return_rate"],x["races"]),reverse=True)
-    return {"saved_ev_races":sum(1 for r in logs if r.get("ev_candidates")),"completed_ev_races":len(done),
-            "pending_ev_races":sum(1 for r in logs if r.get("ev_candidates") and r.get("result_status")!="done"),
-            "stake_per_ticket":stake,"overall":overall,"bands":bands,"venues":venues}
+    return {"saved_ev_races":sum(1 for r in current_logs if r.get("ev_candidates")),"completed_ev_races":len(done),
+            "pending_ev_races":sum(1 for r in current_logs if r.get("ev_candidates") and r.get("result_status")!="done"),
+            "stake_per_ticket":stake,"overall":overall,"bands":bands,"venues":venues,
+            "ev_model_version":EV_MODEL_VERSION,"ev_valid_from":EV_VALID_FROM_DATE,
+            "head_temp":HEAD_TEMP,"second_temp":SECOND_TEMP,"third_temp":THIRD_TEMP,
+            "sanity_cap":MODEL_EV_SANITY_CAP}
 
 @app.route("/")
 def index():
@@ -1269,11 +1297,11 @@ def ev_page():
     today=datetime.datetime.now().strftime("%Y%m%d")
     opts=''.join(f'<option value="{c}">{c} {html.escape(n)}</option>' for c,n in VENUES.items())
     races=''.join(f'<option value="{i}">{i}R</option>' for i in range(1,13))
-    page="""<!doctype html><html lang='ja'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>OTA QUICK SNIPER EV</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;background:#0c111a;color:#edf3ff;margin:0}.w{max-width:940px;margin:auto;padding:14px}.c{background:#151e2c;border:1px solid #263247;border-radius:16px;padding:14px;margin:12px 0}h2,h3{margin:6px 0 12px}select,input,button{font-size:16px;border-radius:10px;padding:11px}select,input{background:#fff;color:#111;border:0}button{border:0;background:#2f7df6;color:#fff;font-weight:700}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row>*{flex:1;min-width:110px}.muted{color:#aab7c9;font-size:13px}.bets{font-size:22px;font-weight:800;letter-spacing:.5px}.ev{font-size:18px;font-weight:800}.good{color:#6fe39c}.bad{color:#ff8a8a}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:8px;border-bottom:1px solid #2a3548;text-align:right}th:first-child,td:first-child{text-align:left}a{color:#8eb9ff}#msg{white-space:pre-wrap}@media(max-width:600px){.row>*{min-width:46%}.bets{font-size:20px}}</style></head><body><div class='w'><div class='row'><h2 style='flex:3'>🚤 OTA QUICK SNIPER <span style='color:#67d4ff'>EV専用</span></h2><a href='/ev/logout' style='flex:0;white-space:nowrap'>ログアウト</a></div><div class='c'><div class='row'><select id='jcd'>__OPTS__</select><input id='hd' value='__TODAY__' inputmode='numeric' maxlength='8'><select id='rno'>__RACES__</select><input id='evmin' value='__EVMIN__' inputmode='decimal'><button onclick='go()'>解析</button></div><p class='muted'>EV閾値は倍率。1.05=モデルEV +5%以上。通常OTAロジックは変更しません。</p><div id='msg'></div></div><div class='c'><h3>通常OTA</h3><div id='normal'>まだ解析していません。</div></div><div class='c'><h3>EV TOP2（検証中）</h3><div id='evbox'>まだ解析していません。</div><p class='muted'>※モデルEVは校正済みの真の期待値ではありません。実績との相関を検証するための値です。</p></div><div class='c'><div class='row'><h3 style='flex:3'>EV検証</h3><button onclick='upd()' style='flex:1'>公式結果を更新</button></div><div id='sum'>読み込み中...</div><h4>EV帯別</h4><table><thead><tr><th>モデルEV</th><th>券数</th><th>的中率</th><th>回収率</th><th>収支</th></tr></thead><tbody id='bands'></tbody></table><h4>会場別</h4><table><thead><tr><th>会場</th><th>R</th><th>的中率</th><th>回収率</th><th>収支</th></tr></thead><tbody id='venues'></tbody></table></div><script>
+    page="""<!doctype html><html lang='ja'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>OTA QUICK SNIPER EV</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;background:#0c111a;color:#edf3ff;margin:0}.w{max-width:940px;margin:auto;padding:14px}.c{background:#151e2c;border:1px solid #263247;border-radius:16px;padding:14px;margin:12px 0}h2,h3{margin:6px 0 12px}select,input,button{font-size:16px;border-radius:10px;padding:11px}select,input{background:#fff;color:#111;border:0}button{border:0;background:#2f7df6;color:#fff;font-weight:700}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row>*{flex:1;min-width:110px}.muted{color:#aab7c9;font-size:13px}.bets{font-size:22px;font-weight:800;letter-spacing:.5px}.ev{font-size:18px;font-weight:800}.good{color:#6fe39c}.bad{color:#ff8a8a}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:8px;border-bottom:1px solid #2a3548;text-align:right}th:first-child,td:first-child{text-align:left}a{color:#8eb9ff}#msg{white-space:pre-wrap}@media(max-width:600px){.row>*{min-width:46%}.bets{font-size:20px}}</style></head><body><div class='w'><div class='row'><h2 style='flex:3'>🚤 OTA QUICK SNIPER <span style='color:#67d4ff'>EV専用</span></h2><a href='/ev/logout' style='flex:0;white-space:nowrap'>ログアウト</a></div><div class='c'><div class='row'><select id='jcd'>__OPTS__</select><input id='hd' value='__TODAY__' inputmode='numeric' maxlength='8'><select id='rno'>__RACES__</select><input id='evmin' value='__EVMIN__' inputmode='decimal'><button onclick='go()'>解析</button></div><p class='muted'>EV閾値は倍率。1.05=モデルEV +5%以上。4.0超は異常値として候補除外。通常OTAロジックは変更しません。</p><div id='msg'></div></div><div class='c'><h3>通常OTA</h3><div id='normal'>まだ解析していません。</div></div><div class='c'><h3>EV TOP2（検証中）</h3><div id='evbox'>まだ解析していません。</div><p class='muted'>※モデルEVは校正済みの真の期待値ではありません。実績との相関を検証するための値です。</p></div><div class='c'><div class='row'><h3 style='flex:3'>EV検証</h3><button onclick='upd()' style='flex:1'>公式結果を更新</button></div><div id='sum'>読み込み中...</div><h4>EV帯別</h4><table><thead><tr><th>モデルEV</th><th>券数</th><th>的中率</th><th>回収率</th><th>収支</th></tr></thead><tbody id='bands'></tbody></table><h4>会場別</h4><table><thead><tr><th>会場</th><th>R</th><th>的中率</th><th>回収率</th><th>収支</th></tr></thead><tbody id='venues'></tbody></table></div><script>
 const yen=n=>new Intl.NumberFormat('ja-JP').format(n)+'円',pct=n=>Number(n||0).toFixed(1)+'%';
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function go(){msg.textContent='解析中...';normal.textContent='';evbox.textContent='';try{const q=new URLSearchParams({jcd:jcd.value,hd:hd.value,rno:rno.value,ev_min:evmin.value});const j=await (await fetch('/api/ev/analyze?'+q)).json();if(!j.ok)throw new Error(j.error||'解析失敗');const d=j.data;msg.textContent=`${d.venue} ${d.race}R / ${d.judge} / 信頼度 ${d.confidence}%`;normal.innerHTML=`<div class='bets'>${d.bets.map((b,i)=>`${i+1}位 ${esc(b)}`).join('　')}</div><p class='muted'>1着順位: ${d.head_rank.join('→')} / 2着順位: ${d.second_rank.join('→')} / 3着順位: ${d.third_rank.join('→')}</p>`;const e=d.ev||{};if(!e.available){evbox.innerHTML=`<span class='bad'>${esc(e.reason||'EV取得不可')}</span>`}else if(!(e.ev_top2||[]).length){evbox.innerHTML=`EV条件を満たす候補なし（オッズ ${e.odds_count}/120）`}else{evbox.innerHTML=e.ev_top2.map((x,i)=>`<div class='ev'>${i+1}位 ${esc(x.combo)}　推定確率 ${x.estimated_prob_pct}%　オッズ ${x.odds}倍　<span class='${x.model_ev>=1?'good':'bad'}'>モデルEV ${(x.model_ev*100).toFixed(1)}%</span>　${x.ota_rank?'OTA通常'+x.ota_rank+'位':'OTA通常7点外'}</div>`).join('<hr style="border-color:#2a3548">')}await loadStats()}catch(e){msg.textContent='エラー: '+e.message}}
-async function loadStats(){const j=await (await fetch('/api/ev/stats')).json();if(!j.ok)return;const s=j.stats,o=s.overall;sum.innerHTML=`保存EVレース <b>${s.saved_ev_races}</b> / 結果確定 <b>${s.completed_ev_races}</b> / 待ち <b>${s.pending_ev_races}</b><br>EV TOP候補全体: ${o.races}R・${o.tickets}券 / 的中率 ${pct(o.hit_rate)} / 回収率 <b class='${o.return_rate>=100?'good':'bad'}'>${pct(o.return_rate)}</b> / 収支 ${yen(o.profit)}`;bands.innerHTML=s.bands.map(b=>`<tr><td>${b.band}</td><td>${b.tickets}</td><td>${pct(b.hit_rate)}</td><td class='${b.return_rate>=100?'good':'bad'}'>${pct(b.return_rate)}</td><td>${yen(b.profit)}</td></tr>`).join('');venues.innerHTML=s.venues.map(v=>`<tr><td>${v.venue}</td><td>${v.races}</td><td>${pct(v.hit_rate)}</td><td class='${v.return_rate>=100?'good':'bad'}'>${pct(v.return_rate)}</td><td>${yen(v.profit)}</td></tr>`).join('')}
+async function loadStats(){const j=await (await fetch('/api/ev/stats')).json();if(!j.ok)return;const s=j.stats,o=s.overall;sum.innerHTML=`保存EVレース <b>${s.saved_ev_races}</b> / 結果確定 <b>${s.completed_ev_races}</b> / 待ち <b>${s.pending_ev_races}</b><br><span class='muted'>新EV検証 ${s.ev_valid_from}以降 / T=${s.head_temp},${s.second_temp},${s.third_temp} / 上限${s.sanity_cap}</span><br>EV TOP候補全体: ${o.races}R・${o.tickets}券 / 的中率 ${pct(o.hit_rate)} / 回収率 <b class='${o.return_rate>=100?'good':'bad'}'>${pct(o.return_rate)}</b> / 収支 ${yen(o.profit)}`;bands.innerHTML=s.bands.map(b=>`<tr><td>${b.band}</td><td>${b.tickets}</td><td>${pct(b.hit_rate)}</td><td class='${b.return_rate>=100?'good':'bad'}'>${pct(b.return_rate)}</td><td>${yen(b.profit)}</td></tr>`).join('');venues.innerHTML=s.venues.map(v=>`<tr><td>${v.venue}</td><td>${v.races}</td><td>${pct(v.hit_rate)}</td><td class='${v.return_rate>=100?'good':'bad'}'>${pct(v.return_rate)}</td><td>${yen(v.profit)}</td></tr>`).join('')}
 async function upd(){msg.textContent='公式結果を最大20R更新中...';const j=await (await fetch('/api/ev/update',{method:'POST'})).json();msg.textContent=j.ok?`確認${j.checked}R / 新規確定${j.updated}R / 残り${j.remaining}R`:(j.error||'更新失敗');await loadStats()}
 loadStats();</script></div></body></html>"""
     page=page.replace("__OPTS__",opts).replace("__TODAY__",today).replace("__RACES__",races).replace("__EVMIN__",f"{EV_MIN:.2f}")
