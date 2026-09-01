@@ -59,7 +59,20 @@ CACHE={}
 CACHE_SECONDS=90
 
 VERIFY_STAKE_YEN=200
-VERIFY_UPDATE_LIMIT=20
+# 【ログ欠損の原因についての注記】
+# 258R・513券を解析したはずが、実際にSupabaseから取得・分析できたのは
+# 222R・434候補だった。保存自体(save_analysis_log)は毎回のanalyze()呼び出しで
+# 必ず行われているため、レコード自体は保存されている。原因は、結果確定
+# (/api/verify/update, /api/ev/update)が1回の呼び出しにつき最大
+# VERIFY_UPDATE_LIMIT件しか処理しないため、レース数がこれを上回るペースで
+# 増えると result_status="pending" のまま確定しないレコードが溜まり、
+# 「result_status=done」だけを対象にする集計・エクスポートから漏れてしまう
+# ことだと考えられる(analyze()自体やev_candidatesの保存漏れではない)。
+# 対策として、(1) この値を少し引き上げる、(2) /api/verify/updateと
+# /api/ev/updateを外部Cron等で10〜15分おきに自動実行し、pending件数を
+# 溜め込まないようにすることを推奨する(Renderの無料枠等でHTTPタイムアウトに
+# 注意しつつ、コード側の値だけを大きくしすぎないこと)。
+VERIFY_UPDATE_LIMIT=int(os.environ.get("VERIFY_UPDATE_LIMIT","30") or 30)
 SUPABASE_PAGE_SIZE=1000
 VERIFY_DIR=os.environ.get("OTA_DATA_DIR",os.path.join(os.path.dirname(__file__),"ota_verify_data"))
 VERIFY_FILE=os.path.join(VERIFY_DIR,"analysis_log.json")
@@ -505,6 +518,300 @@ EV_MIN=1.05
 EV_LOG_FILE=os.path.join(VERIFY_DIR,"ev_verify_log.jsonl")
 
 
+# ==============================================================================
+# EV v2: 実測確率テーブル方式(D方式)+市場インプライド確率補正による校正レイヤー
+#
+# 目的: 旧Softmax方式(HEAD_TEMP等)がモデル確率を実際の的中率より平均で
+# 約3.65倍過大評価しており、「モデルEVが高いほど実ROIも高い」という関係も
+# ほぼ成立していなかったことが、2026-08-30〜09-01の実データ検証(過去チャットでの
+# 分析、最終的に262R・513券)で確認された。
+#
+# この校正レイヤーは、OTA本体のhead_score/second_score/third_scoreそのものを
+# 作り直すのではなく、「OTA通常順位」と「実オッズ」という、的中率と強く
+# 相関することが確認された情報だけを使う。Softmax確率は求めない(=完全に置き換える)。
+#
+# 重要(校正データの固定): 校正表はCALIBRATION_FROM_DATE〜CALIBRATION_TO_DATEの
+# 期間のログだけから作る。これは検証済みの2026-08-30〜09-01のデータであり、
+# 2026-09-02以降にEV v2自身が生成する未来検証ログは、校正表に一切混入しない
+# (build_calibration_table内の日付フィルタで機械的に除外される)。
+# また、2026-08-30より前の旧Softmax時代のログ(オッズ取得パーサーに不具合が
+# あった可能性がある期間)も校正には使わない。
+#
+# 「導入後の成績集計(ev_stats_v2)」はEV_MODEL_VERSION_V2かつ
+# EV_V2_VALID_FROM_DATE以降のログだけに限定し、校正に使った期間のデータを
+# 新モデルの成功実績として扱うことは絶対にない。
+# ==============================================================================
+
+# 【未来検証中は絶対に変更しないこと】
+# 300R終了までEV_MIN・確率方式・OTA7点外除外・購入件数・校正期間・校正表・
+# tie-breakのすべてを固定する。モデルバージョン名自体に主要条件を埋め込み、
+# 条件が変わったログが同じバージョン名で混ざることを防ぐ。
+EV_MODEL_VERSION_V2="EMPIRICAL_D_V2_MARKET_105_OUT7OFF_20260902"
+# 導入(デプロイ)日を必ずここに設定すること。この日付以降のログだけが
+# EV v2の「未来検証専用データ」として集計される(ev_stats_v2)。
+EV_V2_VALID_FROM_DATE="20260902"
+
+# 【重要】この校正表(2026-08-30〜09-01・258R・513券)は、旧Softmax EVが
+# ev_min/サニティキャップを通過した候補として選んだ買い目だけを対象にしている。
+# 262レース×通常OTA7点で本来ありうる最大1834件のうち、オッズ・結果が記録されて
+# いるのは513件のみで、選ばれなかった残りの買い目のオッズは保存されていない
+# (旧v1コードはev_top2のみを保存し、odds_fullフィールド自体が存在しなかった)。
+# したがってこの校正表は「OTA順位×オッズ帯の無条件の実測的中率」ではなく、
+# 「旧EVモデルが候補として選んだ買い目に限定した、条件付きの実測的中率」である。
+# これを無条件の的中率であるかのように扱ったり、推定で埋め合わせたりすることは
+# しない。ev_stats_v2の表示・ログのnoteでもこの限定条件を明記する。
+CALIBRATION_POPULATION_SCOPE="ev_v1_selected_candidates_only"
+CALIBRATION_POPULATION_NOTE=("この校正表は2026-08-30〜09-01の258R・513券から作成。"
+    "ただし513券は旧Softmax EVがev_min/サニティキャップを通過した候補として選んだ"
+    "買い目に限られ、通常OTA7点全体(最大1834件相当)の無条件実測率ではない。"
+    "選ばれなかった買い目のオッズ・結果は当時のログに保存されていないため、"
+    "推定による補完は行っていない。今後odds_full(v2で新規追加)が十分蓄積されれば、"
+    "通常OTA7点全体を母集団とした校正表に更新できる。")
+
+# オッズ帯の区切り。過去ROIを最大化するための細分化はしていない
+# (100倍以上はひとまとめ。今後ログが増えてから見直す前提)。
+ODDS_BAND_DEFS=[(0.0,10.0,"<10"),(10.0,30.0,"10-30"),(30.0,50.0,"30-50"),
+                (50.0,100.0,"50-100"),(100.0,None,"100+")]
+
+# OTA順位の集約グループ。1位・2位は個別、3〜7位はまとめ、7点外は別扱い。
+def ota_group_of(ota_rank):
+    if ota_rank is None:return "OUT7"
+    if ota_rank==1:return "OTA1"
+    if ota_rank==2:return "OTA2"
+    if 3<=ota_rank<=7:return "OTA3_7"
+    return "OUT7"
+
+def odds_band_of(odds):
+    for lo,hi,name in ODDS_BAND_DEFS:
+        if odds>=lo and (hi is None or odds<hi):return name
+    return ODDS_BAND_DEFS[-1][2]
+
+# 【校正データの完全freeze・最重要】
+# 校正表は2026-08-30〜2026-09-01(258R・513券)から一度だけ計算し、
+# その結果をコード内の定数(FROZEN_CALIBRATION_TABLE等)としてそのまま埋め込む。
+# build_calibration_table()はもうSupabase/ローカルログを一切読み直さない。
+# これにより、
+#   (1) 2026-09-02以降にEV v2自身が生成する未来検証ログが校正表に混入することは
+#       構造上ありえない(そもそもログを読まないため)。
+#   (2) 2026-08-30〜09-01のレースをSupabase上で再解析してrace_keyが上書き
+#       されても、校正表自体は影響を受けない(コード内の定数は書き換わらない)。
+# 校正期間の参照用にCALIBRATION_FROM_DATE/TOだけは記録として残す(表示用)。
+CALIBRATION_FROM_DATE="20260830"
+CALIBRATION_TO_DATE="20260901"
+
+# 平滑化(小サンプル対策)のパラメータ。ハードフォールバック方式:
+# セルのnがCALIB_MIN_N_CELL未満なら、そのセル自身の実績を確率計算に使わず
+# OTA順位グループ全体の値をそのまま使う。グループのnがCALIB_MIN_N_GROUP未満
+# なら、さらに全体の値を使う。以下のFROZEN_CALIBRATION_TABLEは、この方式で
+# 258R・513券から一度だけ計算した結果である(再計算はしない)。
+CALIB_MIN_N_CELL=30
+CALIB_MIN_N_GROUP=50
+CALIB_GLOBAL_FALLBACK_RATE=0.03
+
+# 2026-08-30〜09-01・258R・513券から算出した、OTA順位グループ×オッズ帯ごとの
+# 実測的中率(smoothed_rate)と、市場インプライド確率(1/オッズ)に対する補正倍率
+# (correction_factor)。ハードフォールバック適用済み(n<30のセルはグループ値、
+# グループがn<50なら全体値をそのまま使っている)。
+# 【重要】この513券は旧Softmax EVがev_min/サニティキャップを通過した候補として
+# 選んだ買い目に限られる(=通常OTA7点全体の無条件母集団ではない)。
+# CALIBRATION_POPULATION_SCOPE/NOTEを参照。
+FROZEN_CALIBRATION_TABLE={
+    ("OTA1","10-30"):{"n":35,"hits":2,"raw_rate":0.057143,"smoothed_rate":0.057143,"correction_factor":0.833883,"reliable":True},
+    ("OTA1","30-50"):{"n":5,"hits":0,"raw_rate":0.0,"smoothed_rate":0.110092,"correction_factor":0.843822,"reliable":False},
+    ("OTA1","<10"):{"n":69,"hits":10,"raw_rate":0.144928,"smoothed_rate":0.144928,"correction_factor":0.856185,"reliable":True},
+    ("OTA2","10-30"):{"n":45,"hits":2,"raw_rate":0.044444,"smoothed_rate":0.044444,"correction_factor":0.651272,"reliable":True},
+    ("OTA2","30-50"):{"n":3,"hits":0,"raw_rate":0.0,"smoothed_rate":0.073171,"correction_factor":0.858593,"reliable":False},
+    ("OTA2","50-100"):{"n":6,"hits":0,"raw_rate":0.0,"smoothed_rate":0.073171,"correction_factor":0.858593,"reliable":False},
+    ("OTA2","<10"):{"n":28,"hits":4,"raw_rate":0.142857,"smoothed_rate":0.073171,"correction_factor":0.858593,"reliable":False},
+    ("OTA3_7","10-30"):{"n":73,"hits":3,"raw_rate":0.041096,"smoothed_rate":0.041096,"correction_factor":0.692622,"reliable":True},
+    ("OTA3_7","100+"):{"n":2,"hits":0,"raw_rate":0.0,"smoothed_rate":0.028369,"correction_factor":0.496937,"reliable":False},
+    ("OTA3_7","30-50"):{"n":37,"hits":1,"raw_rate":0.027027,"smoothed_rate":0.027027,"correction_factor":0.987872,"reliable":True},
+    ("OTA3_7","50-100"):{"n":11,"hits":0,"raw_rate":0.0,"smoothed_rate":0.028369,"correction_factor":0.496937,"reliable":False},
+    ("OTA3_7","<10"):{"n":18,"hits":0,"raw_rate":0.0,"smoothed_rate":0.028369,"correction_factor":0.496937,"reliable":False},
+    ("OUT7","10-30"):{"n":14,"hits":1,"raw_rate":0.071429,"smoothed_rate":0.005525,"correction_factor":0.409864,"reliable":False},
+    ("OUT7","100+"):{"n":94,"hits":0,"raw_rate":0.0,"smoothed_rate":0.0,"correction_factor":0.0,"reliable":True},
+    ("OUT7","30-50"):{"n":30,"hits":0,"raw_rate":0.0,"smoothed_rate":0.0,"correction_factor":0.0,"reliable":True},
+    ("OUT7","50-100"):{"n":43,"hits":0,"raw_rate":0.0,"smoothed_rate":0.0,"correction_factor":0.0,"reliable":True},
+}
+FROZEN_GLOBAL_RATE=0.044834
+FROZEN_GLOBAL_FACTOR=0.72559
+FROZEN_GROUP_RATE={"OTA1":0.110092,"OTA2":0.073171,"OTA3_7":0.028369,"OUT7":0.005525}
+FROZEN_GROUP_FACTOR={"OTA1":0.843822,"OTA2":0.858593,"OTA3_7":0.496937,"OUT7":0.409864}
+FROZEN_RACES_USED=258
+FROZEN_TICKETS_USED=513
+
+# モデルEV(校正確率×オッズ)の異常値カット。旧EVと同じ考え方。
+EV_V2_SANITY_CAP=4.0
+
+# 【未来検証中は固定・変更禁止】OTA7点外の扱い。過去データでn=154で
+# 的中率0.6%・ROI18.1%と著しく悪かったため除外する。300R検証終了まで
+# 環境変数等での変更は行わない(ハードコード)。
+EV_V2_EXCLUDE_OUT7=True
+
+# 【未来検証中は固定・変更禁止】確率の求め方。
+# "MARKET_ADJUSTED": 市場のインプライド確率(1/オッズ)を土台にし、
+#   OTA順位グループ×オッズ帯ごとの補正倍率を掛ける方式。同じオッズ帯の中でも
+#   オッズが上がれば1/オッズが下がる分、確率も連続的に下がる。
+# "TABLE": 旧来のOTA順位×オッズ帯の実測的中率をそのまま確率として使う方式
+#   (帯の中は一律の確率になる。比較検証用に残してあるが、未来検証では使わない)。
+EV_V2_PROB_METHOD="MARKET_ADJUSTED"
+
+# 【未来検証中は固定・変更禁止】EV閾値。画面のev_min入力があっても、
+# 検証期間中はこの値のみを使う(api_ev_analyze側で強制する)。
+EV_V2_LOCKED_EV_MIN=1.05
+# Trueの間は↑を強制し、画面からの変更を無視する。300R検証が終わり、
+# 次の設計判断をするタイミングで初めてFalseにすること。
+EV_V2_STRATEGY_LOCKED=True
+
+# 1レースにつき実際に「買う」EV候補数(旧EVのev_top2と同じ考え方)。
+# 【未来検証中は固定・変更禁止】
+EV_V2_BUY_TOP_N=2
+
+
+def compute_score_ranks_export(racers):
+    """head_score/second_score/third_scoreそのものは一切変更せず、
+    ログ保存・分析用に「その艇が6艇中何位か」を後から算出するだけの関数。
+    score_racers()やgenerate_bets()には一切手を加えていない。"""
+    out={r["lane"]:{} for r in racers}
+    for key,rankkey in (("head_score","head_rank"),("second_score","second_rank"),("third_score","third_rank")):
+        ordered=sorted(racers,key=lambda r:r.get(key,0.0),reverse=True)
+        for i,r in enumerate(ordered,1):
+            out[r["lane"]][rankkey]=i
+    return out
+
+
+def build_calibration_table(force=False):
+    """校正表はSupabase/ローカルログを一切読み直さず、2026-08-30〜09-01の
+    258R・513券から一度だけ計算し固定したFROZEN_CALIBRATION_TABLEをそのまま
+    返す。force引数は後方互換のためだけに残しているが、何も変えない。"""
+    meta={"built_at":"frozen","frozen":True,
+          "calibration_from":CALIBRATION_FROM_DATE,"calibration_to":CALIBRATION_TO_DATE,
+          "races_used":FROZEN_RACES_USED,"tickets_used":FROZEN_TICKETS_USED,
+          "global_rate":FROZEN_GLOBAL_RATE,"global_correction_factor":FROZEN_GLOBAL_FACTOR,
+          "group_rate":FROZEN_GROUP_RATE,"group_correction_factor":FROZEN_GROUP_FACTOR,
+          "min_n_cell":CALIB_MIN_N_CELL,"min_n_group":CALIB_MIN_N_GROUP,
+          "prob_method":EV_V2_PROB_METHOD,
+          "population_scope":CALIBRATION_POPULATION_SCOPE,
+          "population_note":CALIBRATION_POPULATION_NOTE}
+    return FROZEN_CALIBRATION_TABLE,meta
+
+
+
+def get_calibrated_prob(ota_rank,odds,table=None,meta=None):
+    """校正確率を返す。EV_V2_PROB_METHODに応じて、
+    ・MARKET_ADJUSTED: (1/オッズ) × セルの補正倍率
+    ・TABLE: セルの実測的中率(帯の中は一律)
+    のどちらかを使う。Softmax推定確率は一切使わない。"""
+    if table is None or meta is None:
+        table,meta=build_calibration_table()
+    grp=ota_group_of(ota_rank);band=odds_band_of(odds)
+    cell=table.get((grp,band))
+    if EV_V2_PROB_METHOD=="TABLE":
+        if cell is not None:
+            return cell["smoothed_rate"]
+        return meta.get("group_rate",{}).get(grp,meta.get("global_rate",CALIB_GLOBAL_FALLBACK_RATE))
+    # MARKET_ADJUSTED
+    if cell is not None:
+        factor=cell["correction_factor"]
+    else:
+        factor=meta.get("group_correction_factor",{}).get(grp,meta.get("global_correction_factor",1.0))
+    implied=1.0/odds if odds>0 else 0.0
+    return clamp(implied*factor,0.0,1.0)
+
+
+def compute_ev_table_v2(odds,ev_min,bets,exclude_out7=EV_V2_EXCLUDE_OUT7):
+    """odds: {combo: オッズ} の120通り。bets: 通常OTA上位7点(順序付き)。
+    校正確率 × オッズ でモデルEVを作り、EV_V2_SANITY_CAPを超える異常値は除外する。
+    exclude_out7=Trueの場合、通常OTA7点に入らない買い目は候補から除外する
+    (過去データでn=154・的中率0.6%・ROI18.1%と著しく悪かったための既定値。
+    ただし絶対ルールではなく設定でOFFにできる)。"""
+    table,meta=build_calibration_table()
+    bets_index={b:i+1 for i,b in enumerate(bets)}
+    rows=[]
+    for combo,o in odds.items():
+        ota_rank=bets_index.get(combo)
+        p=get_calibrated_prob(ota_rank,o,table,meta)
+        model_ev=p*o
+        grp=ota_group_of(ota_rank);band=odds_band_of(o)
+        cell=table.get((grp,band),{})
+        rows.append({
+            "combo":combo,
+            "calibrated_prob_pct":round(p*100.0,4),
+            "odds":o,
+            "model_ev":round(model_ev,4),
+            "model_ev_pct":round((model_ev-1.0)*100.0,2),
+            "prob_method":EV_V2_PROB_METHOD,
+            "ota_rank":ota_rank,
+            "ota_group":grp,
+            "odds_band":band,
+            "calib_cell_n":cell.get("n",0),
+            "calib_cell_reliable":cell.get("reliable",False),
+        })
+    # 【tie-break・未来データを見て最適化することは禁止】
+    # MARKET_ADJUSTED方式ではmodel_ev = correction_factorとなるため、同じ
+    # OTA順位グループ×オッズ帯に属する買い目は理論上すべて同一EVになる。
+    # dict/リストの偶然の並び順で順位が決まらないよう、事前に固定した
+    # 決定的な優先順位を使う: (1)モデルEVが高い方が先、(2)通常OTA順位が
+    # ある方を優先し数字が小さい方が先(7点外はNone=最下位扱い)、
+    # (3)それも同じなら実オッズが低い方が先、(4)それでも同じなら買い目
+    # 文字列(combo)の昇順、という完全決定論の規則にする。同じ入力なら
+    # 何度実行しても必ず同じTOP2になる。この規則自体は未来検証開始前に
+    # 固定し、検証終了まで変更しない。
+    rows.sort(key=lambda r:(-r["model_ev"],
+                             r["ota_rank"] if r["ota_rank"] is not None else 999,
+                             r["odds"],
+                             r["combo"]))
+
+    if len(odds)<MIN_ODDS_COVERAGE:
+        candidates=[]
+    else:
+        candidates=[r for r in rows
+                    if r["model_ev"]>=ev_min and r["model_ev"]<=EV_V2_SANITY_CAP
+                    and not (exclude_out7 and r["ota_rank"] is None)]
+    return rows,candidates,meta
+
+
+def compute_ev_v2(ranked,bets,confidence,before,jcd,hd,rno,ev_min=EV_MIN):
+    """EV v2(実測確率テーブル方式・EMPIRICAL_D_V2)。
+    OTA本体のhead_score/second_score/third_score自体は一切変更しない。
+    ここで使うのは「通常OTA順位」と「実オッズ帯」のみ。
+
+    【未来検証中は戦略固定】EV_V2_STRATEGY_LOCKED=Trueの間は、呼び出し元が
+    どんなev_minを渡してきても無視し、EV_V2_LOCKED_EV_MINを強制する。
+    画面のev_min入力欄が変えられても集計条件が割れないようにするため。"""
+    if EV_V2_STRATEGY_LOCKED:
+        ev_min=EV_V2_LOCKED_EV_MIN
+    try:
+        odds,odds_url=fetch_odds3t(jcd,hd,rno)
+    except Exception as e:
+        return {"available":False,"reason":f"オッズ取得に失敗しました: {e}",
+                "odds_count":0,"ranking":[],"candidates":[],"ev_top2":[],
+                "ev_candidates_all":[],"odds_full":{},
+                "ev_model_version":EV_MODEL_VERSION_V2,"ev_valid_from":EV_V2_VALID_FROM_DATE}
+
+    ranking,candidates,calib_meta=compute_ev_table_v2(odds,ev_min,bets,EV_V2_EXCLUDE_OUT7)
+
+    reason=None
+    if len(odds)<MIN_ODDS_COVERAGE:
+        reason=f"オッズ取得件数が{len(odds)}/120と不十分なため、EV候補は非表示にしています(数字自体は信用できません)。"
+    elif not candidates:
+        if EV_V2_EXCLUDE_OUT7 and all(r["ota_rank"] is None for r in ranking if r["model_ev"]>=ev_min):
+            reason="EV条件を満たす買い目はありましたが、いずれも通常OTA7点外のため除外しました(設定でOFFにできます)。"
+        else:
+            reason=f"モデルEV {EV_V2_SANITY_CAP:.1f}超の除外、またはEV_MIN未満のため候補がありません。"
+
+    ev_top2=candidates[:EV_V2_BUY_TOP_N]
+
+    return {"available":True,"reason":reason,"odds_count":len(odds),"odds_url":odds_url,
+            "ev_min":ev_min,"ev_sanity_cap":EV_V2_SANITY_CAP,
+            "ev_model_version":EV_MODEL_VERSION_V2,"ev_valid_from":EV_V2_VALID_FROM_DATE,
+            "exclude_out7":EV_V2_EXCLUDE_OUT7,"strategy_locked":EV_V2_STRATEGY_LOCKED,
+            "ranking":ranking[:15],"candidates":candidates,"ev_top2":ev_top2,
+            "ev_candidates_all":candidates,"odds_full":odds,
+            "calibration_meta":calib_meta,
+            "note":"校正推定確率は2026-08-30〜09-01の258R・513券(旧EVが候補として選んだ買い目に限る)からの実測ベースの推定値であり、通常OTA7点全体の無条件的中率でも、真の的中確率でもありません。校正モデルEVも参考値です。"}
+
+
 def parse_odds3t(src):
     """3連単オッズページから {"a-b-c": オッズ} を抽出する。
 
@@ -894,7 +1201,7 @@ def analyze(jcd,rno,hd,ev_min=EV_MIN,include_ev=False):
             "third_rank":[r["lane"] for r in sorted(ranked,key=lambda x:x["third_score"],reverse=True)],
             "cached":False}
     if include_ev:
-        result["ev"]=compute_ev(ranked,bets,confidence,before,jcd,hd,rno,ev_min=ev_min)
+        result["ev"]=compute_ev_v2(ranked,bets,confidence,before,jcd,hd,rno,ev_min=ev_min)
     CACHE[key]={"time":now,"data":result};return result
 
 def supabase_enabled():
@@ -990,6 +1297,13 @@ def save_analysis_log(data):
     logs=load_logs()
     key=f"{data['date']}:{str(data['venue_code']).zfill(2)}:{int(data['race'])}"
     old=next((x for x in logs if x.get("key")==key),None)
+    # 【校正期間データの保護】校正表自体はコード内の固定定数(FROZEN_CALIBRATION_TABLE)
+    # を使っており、Supabaseを読み直すことは無いため校正結果に影響はしないが、
+    # 念のため2026-08-30〜09-01の確定済み記録は上書きしない(監査・再検証用に
+    # 当時のログをそのまま残す)。
+    if (old and old.get("result_status")=="done"
+            and CALIBRATION_FROM_DATE<=str(data.get("date",""))<=CALIBRATION_TO_DATE):
+        return
     rec={
         "key":key,"saved_at":datetime.datetime.now().isoformat(timespec="seconds"),
         "app_version":data.get("app_version",""),"date":data["date"],
@@ -1001,17 +1315,43 @@ def save_analysis_log(data):
     ev=data.get("ev")
     if isinstance(ev,dict):
         rec["ev_saved_at"]=datetime.datetime.now().isoformat(timespec="seconds")
-        rec["ev_model_version"]=EV_MODEL_VERSION;rec["ev_valid_from"]=EV_VALID_FROM_DATE
-        rec["ev_head_temp"]=HEAD_TEMP;rec["ev_second_temp"]=SECOND_TEMP;rec["ev_third_temp"]=THIRD_TEMP
-        rec["ev_sanity_cap"]=MODEL_EV_SANITY_CAP;rec["ev_min"]=ev.get("ev_min")
-        rec["ev_odds_count"]=ev.get("odds_count",0);rec["ev_prob_sum_check"]=ev.get("prob_sum_check")
-        rec["ev_candidates"]=list(ev.get("ev_top2") or [])[:2];rec["ev_available"]=bool(ev.get("available"))
+        rec["ev_model_version"]=ev.get("ev_model_version",EV_MODEL_VERSION_V2)
+        rec["ev_valid_from"]=ev.get("ev_valid_from",EV_V2_VALID_FROM_DATE)
+        rec["ev_sanity_cap"]=ev.get("ev_sanity_cap",EV_V2_SANITY_CAP);rec["ev_min"]=ev.get("ev_min")
+        rec["ev_exclude_out7"]=ev.get("exclude_out7",EV_V2_EXCLUDE_OUT7)
+        rec["ev_odds_count"]=ev.get("odds_count",0)
+        rec["ev_calibration_meta"]=ev.get("calibration_meta")
+        # ev_candidates: 実際に「買った」上位N件(ROI/的中率集計はこの件数だけを対象にする、
+        # 旧EVのev_top2と同じ考え方)。ev_candidates_all: 分析用に、条件を満たした
+        # 全候補をできるだけ保存しておく(欠損を防ぐため、旧EVのように2件で
+        # 打ち切らない)。件数だけは暴走保存を避けるため上限を設ける。
+        rec["ev_candidates"]=list(ev.get("ev_top2") or [])
+        rec["ev_candidates_all"]=list(ev.get("ev_candidates_all") or [])[:60]
+        rec["ev_available"]=bool(ev.get("available"))
         rec["ev_reason"]=ev.get("reason")
+        # 分析用に、通常OTA全艇のhead/second/third_scoreとその順位(1〜6位)を
+        # 保存しておく。score_racers()自体は一切変更せず、既に計算済みの値から
+        # 順位を導出しているだけ。
+        racers=data.get("racers") or []
+        if racers:
+            ranks=compute_score_ranks_export(racers)
+            rec["racers_full"]=[{
+                "lane":r.get("lane"),"class":r.get("class"),
+                "head_score":r.get("head_score"),"head_rank":ranks.get(r.get("lane"),{}).get("head_rank"),
+                "second_score":r.get("second_score"),"second_rank":ranks.get(r.get("lane"),{}).get("second_rank"),
+                "third_score":r.get("third_score"),"third_rank":ranks.get(r.get("lane"),{}).get("third_rank"),
+            } for r in sorted(racers,key=lambda x:x.get("lane",0))]
+        # 3連単120通りの実オッズを丸ごと保存しておく(今後の分析用)。
+        odds_full=ev.get("odds_full") or {}
+        rec["odds_full"]={k:v for k,v in odds_full.items()}
     if old:
         for k in ("result","payout_100","result_status","hit_rank","result_checked_at","hit_ev_rank"):
             if old.get(k) is not None:rec[k]=old.get(k)
         if "ev" not in data:
-            for k in ("ev_saved_at","ev_model_version","ev_valid_from","ev_head_temp","ev_second_temp","ev_third_temp","ev_sanity_cap","ev_min","ev_odds_count","ev_prob_sum_check","ev_candidates","ev_available","ev_reason","hit_ev_rank"):
+            for k in ("ev_saved_at","ev_model_version","ev_valid_from","ev_sanity_cap","ev_min",
+                      "ev_exclude_out7","ev_odds_count","ev_calibration_meta","ev_candidates",
+                      "ev_candidates_all","ev_available","ev_reason","hit_ev_rank",
+                      "racers_full","odds_full"):
                 if k in old:rec[k]=old.get(k)
     if rec.get("result") and rec.get("ev_candidates"):
         try:
@@ -1210,6 +1550,63 @@ def ev_stats(stake=VERIFY_STAKE_YEN):
             "head_temp":HEAD_TEMP,"second_temp":SECOND_TEMP,"third_temp":THIRD_TEMP,
             "sanity_cap":MODEL_EV_SANITY_CAP}
 
+def ev_stats_v2(stake=VERIFY_STAKE_YEN):
+    """EV v2(EMPIRICAL_D_V2)専用の検証集計。EV_V2_VALID_FROM_DATE以降・
+    EV_MODEL_VERSION_V2のログだけを対象にする(旧Softmax方式のログとは混ぜない)。
+    校正に使ったCALIBRATION_FROM_DATE〜CALIBRATION_TO_DATE(2026-08-30〜09-01)の
+    データがここに混入して「新モデルの成功実績」として表示されることはない
+    (日付とモデルバージョンで厳密に分離しているため)。"""
+    logs=load_logs()
+    current_logs=[r for r in logs if str(r.get("date",""))>=EV_V2_VALID_FROM_DATE and r.get("ev_model_version")==EV_MODEL_VERSION_V2]
+    done=[r for r in current_logs if r.get("result_status")=="done" and r.get("result") and r.get("ev_candidates")]
+    overall=calc_ev_bucket(done,stake)
+
+    tickets=[]
+    for r in done:
+        for c in (r.get("ev_candidates") or []):
+            mev=to_float(c.get("model_ev"),None)
+            if mev is not None:
+                tickets.append({"model_ev":mev,"ota_rank":c.get("ota_rank"),
+                                 "hit":c.get("combo")==r.get("result"),"payout_100":r.get("payout_100") or 0})
+
+    bands=[]
+    for label,lo,hi in [("105-120%",1.05,1.20),("120-150%",1.20,1.50),("150-200%",1.50,2.00),
+                         ("200-250%",2.00,2.50),("250-300%",2.50,3.00),("300%+",3.00,EV_V2_SANITY_CAP+1e-12)]:
+        sub=[x for x in tickets if x["model_ev"]>=lo and x["model_ev"]<hi];inv=len(sub)*stake
+        hit=sum(1 for x in sub if x["hit"]);pay=sum(int(round(x["payout_100"]*(stake/100))) for x in sub if x["hit"])
+        bands.append({"band":label,"tickets":len(sub),"hits":hit,"hit_rate":round(hit/len(sub)*100,2) if sub else 0,
+                      "investment":inv,"payout":pay,"profit":pay-inv,"return_rate":round(pay/inv*100,2) if inv else 0,
+                      "note":"参考(n<20)" if len(sub)<20 else ""})
+
+    ota_groups=[]
+    for grp,label in (("OTA1","OTA1位"),("OTA2","OTA2位"),("OTA3_7","OTA3〜7位"),("OUT7","OTA7点外")):
+        sub=[x for x in tickets if ota_group_of(x["ota_rank"])==grp];inv=len(sub)*stake
+        hit=sum(1 for x in sub if x["hit"]);pay=sum(int(round(x["payout_100"]*(stake/100))) for x in sub if x["hit"])
+        ota_groups.append({"group":label,"tickets":len(sub),"hits":hit,
+                            "hit_rate":round(hit/len(sub)*100,2) if sub else 0,
+                            "investment":inv,"payout":pay,"profit":pay-inv,
+                            "return_rate":round(pay/inv*100,2) if inv else 0,
+                            "note":"参考(n<20)" if len(sub)<20 else ""})
+
+    venues=[]
+    for code,name in VENUES.items():
+        sub=[r for r in done if r.get("venue_code")==code]
+        if sub:
+            b=calc_ev_bucket(sub,stake)
+            b.update({"venue_code":code,"venue":name,"note":"参考(n<20)" if b["races"]<20 else ""})
+            venues.append(b)
+    venues.sort(key=lambda x:(x["return_rate"],x["races"]),reverse=True)
+
+    _,calib_meta=build_calibration_table()
+
+    return {"saved_ev_races":sum(1 for r in current_logs if r.get("ev_candidates")),
+            "completed_ev_races":len(done),
+            "pending_ev_races":sum(1 for r in current_logs if r.get("ev_candidates") and r.get("result_status")!="done"),
+            "stake_per_ticket":stake,"overall":overall,"bands":bands,"ota_groups":ota_groups,"venues":venues,
+            "ev_model_version":EV_MODEL_VERSION_V2,"ev_valid_from":EV_V2_VALID_FROM_DATE,
+            "exclude_out7":EV_V2_EXCLUDE_OUT7,"calibration_meta":calib_meta}
+
+
 @app.route("/")
 def index():
     today=datetime.datetime.now().strftime("%Y%m%d")
@@ -1228,7 +1625,10 @@ def api_analyze():
 @ev_login_required
 def api_ev_analyze():
     try:
-        jcd=str(request.args.get("jcd","18")).zfill(2);rno=int(request.args.get("rno","1"));hd=request.args.get("hd") or datetime.datetime.now().strftime("%Y%m%d");ev_min=to_float(request.args.get("ev_min"),EV_MIN)
+        jcd=str(request.args.get("jcd","18")).zfill(2);rno=int(request.args.get("rno","1"));hd=request.args.get("hd") or datetime.datetime.now().strftime("%Y%m%d")
+        # 【未来検証中は固定】EV_V2_STRATEGY_LOCKED=Trueの間は画面のev_min入力を
+        # 無視し、常にEV_V2_LOCKED_EV_MINを使う(compute_ev_v2側でも二重に強制)。
+        ev_min=EV_V2_LOCKED_EV_MIN if EV_V2_STRATEGY_LOCKED else to_float(request.args.get("ev_min"),EV_MIN)
         if jcd not in VENUES:return jsonify({"ok":False,"error":"場コードが不正です"}),400
         if not 1<=rno<=12:return jsonify({"ok":False,"error":"レース番号は1～12です"}),400
         data=analyze(jcd,rno,hd,ev_min=ev_min,include_ev=True);save_analysis_log(data);return jsonify({"ok":True,"data":data})
@@ -1236,7 +1636,14 @@ def api_ev_analyze():
 
 @app.route("/api/ev/stats")
 @ev_login_required
-def api_ev_stats():return jsonify({"ok":True,"stats":ev_stats(VERIFY_STAKE_YEN)})
+def api_ev_stats():return jsonify({"ok":True,"stats":ev_stats_v2(VERIFY_STAKE_YEN)})
+
+@app.route("/api/ev/stats/legacy")
+@ev_login_required
+def api_ev_stats_legacy():
+    """旧Softmax方式(EV_MODEL_VERSION)の検証結果。旧ログは削除していないため
+    いつでも参照できる。EV v2の成績とは完全に分離して表示すること。"""
+    return jsonify({"ok":True,"stats":ev_stats(VERIFY_STAKE_YEN)})
 
 @app.route("/api/ev/update",methods=["GET","POST"])
 @ev_login_required
@@ -1297,14 +1704,18 @@ def ev_page():
     today=datetime.datetime.now().strftime("%Y%m%d")
     opts=''.join(f'<option value="{c}">{c} {html.escape(n)}</option>' for c,n in VENUES.items())
     races=''.join(f'<option value="{i}">{i}R</option>' for i in range(1,13))
-    page="""<!doctype html><html lang='ja'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>OTA QUICK SNIPER EV</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;background:#0c111a;color:#edf3ff;margin:0}.w{max-width:940px;margin:auto;padding:14px}.c{background:#151e2c;border:1px solid #263247;border-radius:16px;padding:14px;margin:12px 0}h2,h3{margin:6px 0 12px}select,input,button{font-size:16px;border-radius:10px;padding:11px}select,input{background:#fff;color:#111;border:0}button{border:0;background:#2f7df6;color:#fff;font-weight:700}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row>*{flex:1;min-width:110px}.muted{color:#aab7c9;font-size:13px}.bets{font-size:22px;font-weight:800;letter-spacing:.5px}.ev{font-size:18px;font-weight:800}.good{color:#6fe39c}.bad{color:#ff8a8a}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:8px;border-bottom:1px solid #2a3548;text-align:right}th:first-child,td:first-child{text-align:left}a{color:#8eb9ff}#msg{white-space:pre-wrap}@media(max-width:600px){.row>*{min-width:46%}.bets{font-size:20px}}</style></head><body><div class='w'><div class='row'><h2 style='flex:3'>🚤 OTA QUICK SNIPER <span style='color:#67d4ff'>EV専用</span></h2><a href='/ev/logout' style='flex:0;white-space:nowrap'>ログアウト</a></div><div class='c'><div class='row'><select id='jcd'>__OPTS__</select><input id='hd' value='__TODAY__' inputmode='numeric' maxlength='8'><select id='rno'>__RACES__</select><input id='evmin' value='__EVMIN__' inputmode='decimal'><button onclick='go()'>解析</button></div><p class='muted'>EV閾値は倍率。1.05=モデルEV +5%以上。4.0超は異常値として候補除外。通常OTAロジックは変更しません。</p><div id='msg'></div></div><div class='c'><h3>通常OTA</h3><div id='normal'>まだ解析していません。</div></div><div class='c'><h3>EV TOP2（検証中）</h3><div id='evbox'>まだ解析していません。</div><p class='muted'>※モデルEVは校正済みの真の期待値ではありません。実績との相関を検証するための値です。</p></div><div class='c'><div class='row'><h3 style='flex:3'>EV検証</h3><button onclick='upd()' style='flex:1'>公式結果を更新</button></div><div id='sum'>読み込み中...</div><h4>EV帯別</h4><table><thead><tr><th>モデルEV</th><th>券数</th><th>的中率</th><th>回収率</th><th>収支</th></tr></thead><tbody id='bands'></tbody></table><h4>会場別</h4><table><thead><tr><th>会場</th><th>R</th><th>的中率</th><th>回収率</th><th>収支</th></tr></thead><tbody id='venues'></tbody></table></div><script>
+    page="""<!doctype html><html lang='ja'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>OTA QUICK SNIPER EV</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;background:#0c111a;color:#edf3ff;margin:0}.w{max-width:940px;margin:auto;padding:14px}.c{background:#151e2c;border:1px solid #263247;border-radius:16px;padding:14px;margin:12px 0}h2,h3{margin:6px 0 12px}select,input,button{font-size:16px;border-radius:10px;padding:11px}select,input{background:#fff;color:#111;border:0}button{border:0;background:#2f7df6;color:#fff;font-weight:700}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row>*{flex:1;min-width:110px}.muted{color:#aab7c9;font-size:13px}.bets{font-size:22px;font-weight:800;letter-spacing:.5px}.ev{font-size:18px;font-weight:800}.good{color:#6fe39c}.bad{color:#ff8a8a}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:8px;border-bottom:1px solid #2a3548;text-align:right}th:first-child,td:first-child{text-align:left}a{color:#8eb9ff}#msg{white-space:pre-wrap}@media(max-width:600px){.row>*{min-width:46%}.bets{font-size:20px}}</style></head><body><div class='w'><div class='row'><h2 style='flex:3'>🚤 OTA QUICK SNIPER <span style='color:#67d4ff'>EV専用</span></h2><a href='/ev/logout' style='flex:0;white-space:nowrap'>ログアウト</a></div><div class='c'><div class='row'><select id='jcd'>__OPTS__</select><input id='hd' value='__TODAY__' inputmode='numeric' maxlength='8'><select id='rno'>__RACES__</select><input id='evmin' value='__EVMIN__' inputmode='decimal' __EVMIN_DISABLED__><button onclick='go()'>解析</button></div><p class='muted'>EV閾値は倍率。1.05=モデルEV +5%以上。校正方式はEV v2(__MODELVER__)。__LOCKNOTE__通常OTAロジックは変更しません。</p><div id='msg'></div></div><div class='c'><h3>通常OTA</h3><div id='normal'>まだ解析していません。</div></div><div class='c'><h3>EV TOP（EV v2・検証中）</h3><div id='evbox'>まだ解析していません。</div><p class='muted'>※校正推定確率・校正モデルEVは2026-08-30〜09-01の258R・513券(旧EVが候補に選んだ買い目に限る)からの実測ベースの推定値で、通常OTA7点全体の無条件的中率でも真の的中確率でもありません。</p></div><div class='c'><div class='row'><h3 style='flex:3'>EV v2 検証</h3><button onclick='upd()' style='flex:1'>公式結果を更新</button></div><div id='sum'>読み込み中...</div><h4>EV帯別</h4><table><thead><tr><th>モデルEV</th><th>券数</th><th>的中率</th><th>回収率</th><th>収支</th></tr></thead><tbody id='bands'></tbody></table><h4>通常OTA順位別</h4><table><thead><tr><th>順位</th><th>券数</th><th>的中率</th><th>回収率</th><th>収支</th></tr></thead><tbody id='otagroups'></tbody></table><h4>会場別（n&lt;20は参考）</h4><table><thead><tr><th>会場</th><th>R</th><th>的中率</th><th>回収率</th><th>収支</th></tr></thead><tbody id='venues'></tbody></table></div><script>
 const yen=n=>new Intl.NumberFormat('ja-JP').format(n)+'円',pct=n=>Number(n||0).toFixed(1)+'%';
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-async function go(){msg.textContent='解析中...';normal.textContent='';evbox.textContent='';try{const q=new URLSearchParams({jcd:jcd.value,hd:hd.value,rno:rno.value,ev_min:evmin.value});const j=await (await fetch('/api/ev/analyze?'+q)).json();if(!j.ok)throw new Error(j.error||'解析失敗');const d=j.data;msg.textContent=`${d.venue} ${d.race}R / ${d.judge} / 信頼度 ${d.confidence}%`;normal.innerHTML=`<div class='bets'>${d.bets.map((b,i)=>`${i+1}位 ${esc(b)}`).join('　')}</div><p class='muted'>1着順位: ${d.head_rank.join('→')} / 2着順位: ${d.second_rank.join('→')} / 3着順位: ${d.third_rank.join('→')}</p>`;const e=d.ev||{};if(!e.available){evbox.innerHTML=`<span class='bad'>${esc(e.reason||'EV取得不可')}</span>`}else if(!(e.ev_top2||[]).length){evbox.innerHTML=`EV条件を満たす候補なし（オッズ ${e.odds_count}/120）`}else{evbox.innerHTML=e.ev_top2.map((x,i)=>`<div class='ev'>${i+1}位 ${esc(x.combo)}　推定確率 ${x.estimated_prob_pct}%　オッズ ${x.odds}倍　<span class='${x.model_ev>=1?'good':'bad'}'>モデルEV ${(x.model_ev*100).toFixed(1)}%</span>　${x.ota_rank?'OTA通常'+x.ota_rank+'位':'OTA通常7点外'}</div>`).join('<hr style="border-color:#2a3548">')}await loadStats()}catch(e){msg.textContent='エラー: '+e.message}}
-async function loadStats(){const j=await (await fetch('/api/ev/stats')).json();if(!j.ok)return;const s=j.stats,o=s.overall;sum.innerHTML=`保存EVレース <b>${s.saved_ev_races}</b> / 結果確定 <b>${s.completed_ev_races}</b> / 待ち <b>${s.pending_ev_races}</b><br><span class='muted'>新EV検証 ${s.ev_valid_from}以降 / T=${s.head_temp},${s.second_temp},${s.third_temp} / 上限${s.sanity_cap}</span><br>EV TOP候補全体: ${o.races}R・${o.tickets}券 / 的中率 ${pct(o.hit_rate)} / 回収率 <b class='${o.return_rate>=100?'good':'bad'}'>${pct(o.return_rate)}</b> / 収支 ${yen(o.profit)}`;bands.innerHTML=s.bands.map(b=>`<tr><td>${b.band}</td><td>${b.tickets}</td><td>${pct(b.hit_rate)}</td><td class='${b.return_rate>=100?'good':'bad'}'>${pct(b.return_rate)}</td><td>${yen(b.profit)}</td></tr>`).join('');venues.innerHTML=s.venues.map(v=>`<tr><td>${v.venue}</td><td>${v.races}</td><td>${pct(v.hit_rate)}</td><td class='${v.return_rate>=100?'good':'bad'}'>${pct(v.return_rate)}</td><td>${yen(v.profit)}</td></tr>`).join('')}
-async function upd(){msg.textContent='公式結果を最大20R更新中...';const j=await (await fetch('/api/ev/update',{method:'POST'})).json();msg.textContent=j.ok?`確認${j.checked}R / 新規確定${j.updated}R / 残り${j.remaining}R`:(j.error||'更新失敗');await loadStats()}
+async function go(){msg.textContent='解析中...';normal.textContent='';evbox.textContent='';try{const q=new URLSearchParams({jcd:jcd.value,hd:hd.value,rno:rno.value});const j=await (await fetch('/api/ev/analyze?'+q)).json();if(!j.ok)throw new Error(j.error||'解析失敗');const d=j.data;msg.textContent=`${d.venue} ${d.race}R / ${d.judge} / 信頼度 ${d.confidence}%`;normal.innerHTML=`<div class='bets'>${d.bets.map((b,i)=>`${i+1}位 ${esc(b)}`).join('　')}</div><p class='muted'>1着順位: ${d.head_rank.join('→')} / 2着順位: ${d.second_rank.join('→')} / 3着順位: ${d.third_rank.join('→')}</p>`;const e=d.ev||{};if(!e.available){evbox.innerHTML=`<span class='bad'>${esc(e.reason||'EV取得不可')}</span>`}else if(!(e.ev_top2||[]).length){evbox.innerHTML=`EV条件を満たす候補なし（オッズ ${e.odds_count}/120）`}else{evbox.innerHTML=e.ev_top2.map((x,i)=>`<div class='ev'>${i+1}位 ${esc(x.combo)}　校正推定確率 ${x.calibrated_prob_pct}%　オッズ ${x.odds}倍　<span class='${x.model_ev>=1?'good':'bad'}'>校正モデルEV ${(x.model_ev*100).toFixed(1)}%</span>　${x.ota_rank?'OTA通常'+x.ota_rank+'位':'OTA通常7点外'}</div>`).join('<hr style="border-color:#2a3548">')}await loadStats()}catch(e){msg.textContent='エラー: '+e.message}}
+async function loadStats(){const j=await (await fetch('/api/ev/stats')).json();if(!j.ok)return;const s=j.stats,o=s.overall,cm=s.calibration_meta||{};sum.innerHTML=`保存EVレース <b>${s.saved_ev_races}</b> / 結果確定 <b>${s.completed_ev_races}</b> / 待ち <b>${s.pending_ev_races}</b><br><span class='muted'>EV v2検証 ${s.ev_valid_from}以降(校正期間 ${cm.calibration_from||'-'}〜${cm.calibration_to||'-'}は固定・以降のデータは校正に混ざりません) / 校正方式:${cm.prob_method||'-'} / 校正に使ったログ ${cm.races_used||0}R・${cm.tickets_used||0}券 / OTA7点外除外:${s.exclude_out7?'ON':'OFF'}</span><br>EV TOP候補全体: ${o.races}R・${o.tickets}券 / 的中率 ${pct(o.hit_rate)} / 回収率 <b class='${o.return_rate>=100?'good':'bad'}'>${pct(o.return_rate)}</b> / 収支 ${yen(o.profit)}`;bands.innerHTML=s.bands.map(b=>`<tr><td>${b.band}${b.note?'<br><span class="muted">'+b.note+'</span>':''}</td><td>${b.tickets}</td><td>${pct(b.hit_rate)}</td><td class='${b.return_rate>=100?'good':'bad'}'>${pct(b.return_rate)}</td><td>${yen(b.profit)}</td></tr>`).join('');otagroups.innerHTML=(s.ota_groups||[]).map(g=>`<tr><td>${g.group}${g.note?'<br><span class="muted">'+g.note+'</span>':''}</td><td>${g.tickets}</td><td>${pct(g.hit_rate)}</td><td class='${g.return_rate>=100?'good':'bad'}'>${pct(g.return_rate)}</td><td>${yen(g.profit)}</td></tr>`).join('');venues.innerHTML=s.venues.map(v=>`<tr><td>${v.venue}${v.note?'<br><span class="muted">'+v.note+'</span>':''}</td><td>${v.races}</td><td>${pct(v.hit_rate)}</td><td class='${v.return_rate>=100?'good':'bad'}'>${pct(v.return_rate)}</td><td>${yen(v.profit)}</td></tr>`).join('')}
+async function upd(){msg.textContent='公式結果を更新中...';const j=await (await fetch('/api/ev/update',{method:'POST'})).json();msg.textContent=j.ok?`確認${j.checked}R / 新規確定${j.updated}R / 残り${j.remaining}R`:(j.error||'更新失敗');await loadStats()}
 loadStats();</script></div></body></html>"""
-    page=page.replace("__OPTS__",opts).replace("__TODAY__",today).replace("__RACES__",races).replace("__EVMIN__",f"{EV_MIN:.2f}")
+    page=page.replace("__OPTS__",opts).replace("__TODAY__",today).replace("__RACES__",races)
+    page=page.replace("__EVMIN__",f"{EV_V2_LOCKED_EV_MIN:.2f}")
+    page=page.replace("__EVMIN_DISABLED__","readonly disabled" if EV_V2_STRATEGY_LOCKED else "")
+    page=page.replace("__MODELVER__",html.escape(EV_MODEL_VERSION_V2))
+    page=page.replace("__LOCKNOTE__",f"未来検証中はEV閾値{EV_V2_LOCKED_EV_MIN:.2f}・OTA7点外除外ON・BUY TOP{EV_V2_BUY_TOP_N}で固定しています(画面からは変更できません)。" if EV_V2_STRATEGY_LOCKED else "")
     return Response(page,mimetype="text/html")
 
 @app.route("/verify")
